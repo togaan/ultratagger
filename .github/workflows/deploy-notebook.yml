@@ -1,0 +1,25 @@
+name: Deploy Notebook to GitHub
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Set up Git
+        run: |
+          git config --global user.name "UltraTaggerBot"
+          git config --global user.email "bot@ultratagger.ai"
+
+      - name: Commit and Push notebook (if updated)
+        run: |
+          git pull
+          git add metadata_analysis_full.ipynb || true
+          git commit -m "🔁 Sync notebook from Replit/Colab" || echo "No changes to commit"
+          git push https://x-access-token:${{ secrets.DEPLOY_TOKEN }}@github.com/togaan/ultratagger.git main
