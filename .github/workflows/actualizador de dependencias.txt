@@ -1,0 +1,193 @@
+# requirements: yt-dlp, aiohttp, async-timeout, python-dotenv, openai, beautifulsoup4, rapidfuzz, sentence-transformers, torch, spacy, Pillow, soundfile, shazamio, essentia, openl3, aiocache, backoff, psutil
+# api_keys: None
+
+import sys
+import subprocess
+import shutil
+import multiprocessing
+import platform
+import pkg_resources
+import os
+import requests
+import zipfile
+import argparse
+from io import BytesIO
+import time
+
+
+def descargar_binario(nombre, url, carpeta_binarios, usar_aria2c, timeout):
+    ruta_final = shutil.which(nombre, path=carpeta_binarios)
+    if ruta_final:
+        print(f"✅ {nombre} ya está disponible en {ruta_final}.")
+        return
+    print(f"📥 Descargando {nombre} desde {url}...")
+    try:
+        if usar_aria2c:
+            subprocess.run([
+                "aria2c", url,
+                "--dir", carpeta_binarios,
+                "--max-connection-per-server=16",
+                "--split=16",
+                "--quiet"
+            ], check=True)
+        else:
+            with requests.Session() as session:
+                response = session.get(url, timeout=timeout, stream=True)
+                response.raise_for_status()
+                if zipfile.is_zipfile(BytesIO(response.content)):
+                    with zipfile.ZipFile(BytesIO(response.content)) as zip_ref:
+                        zip_ref.extractall(carpeta_binarios)
+                else:
+                    raise Exception("Archivo descargado no es un ZIP válido")
+    except Exception as e:
+        print(f"❌ Error al descargar {nombre}: {e}")
+
+
+def instalar_aria2c_si_falta(binarios, carpeta_binarios, timeout):
+    if shutil.which("aria2c"):
+        print("🚀 aria2c detectado. Las descargas se harán con aceleración.")
+        return True
+    else:
+        print("⚠️ aria2c no encontrado. Intentando instalar automáticamente...")
+        url = binarios['aria2c']
+        try:
+            with requests.Session() as session:
+                response = session.get(url, timeout=timeout, stream=True)
+                response.raise_for_status()
+                with zipfile.ZipFile(BytesIO(response.content)) as zip_ref:
+                    zip_ref.extractall(carpeta_binarios)
+            if shutil.which("aria2c", path=carpeta_binarios):
+                print("✅ aria2c instalado correctamente y listo para usarse.")
+                return True
+            else:
+                print("❌ No se pudo instalar aria2c correctamente.")
+        except Exception as e:
+            print(f"❌ Error instalando aria2c: {e}")
+        return False
+
+
+class InstallerManager:
+    def __init__(self, dependencias, binarios, carpeta_binarios='./bin', timeout=15):
+        self.dependencias = dependencias
+        self.binarios = binarios
+        self.carpeta_binarios = carpeta_binarios
+        self.timeout = timeout
+        self.usar_aria2c = False
+        os.makedirs(self.carpeta_binarios, exist_ok=True)
+
+    def tiene_conexion(self):
+        try:
+            requests.get('https://pypi.org', timeout=5)
+            return True
+        except:
+            return False
+
+    def reintentar(self, funcion, intentos=3, espera=2, *args, **kwargs):
+        for intento in range(intentos):
+            try:
+                return funcion(*args, **kwargs)
+            except Exception as e:
+                print(f"⚠️ Error: {e}. Reintentando {intento + 1}/{intentos}...")
+                time.sleep(espera * (2 ** intento))
+        print("❌ Fallo persistente tras múltiples intentos.")
+        return None
+
+    def comprobar_entorno(self):
+        if sys.version_info < (3, 11):
+            raise EnvironmentError("Python 3.11 o superior es requerido.")
+        try:
+            subprocess.run([sys.executable, '-m', 'pip', '--version'], check=True, stdout=subprocess.PIPE)
+            subprocess.run([sys.executable, '-m', 'pip', 'install', '--upgrade', 'pip'], check=True)
+        except Exception:
+            raise EnvironmentError("pip no está disponible o falló la actualización.")
+
+    def obtener_dependencias_desactualizadas(self):
+        resultado = subprocess.run(
+            [sys.executable, '-m', 'pip', 'list', '--outdated', '--format=freeze'],
+            capture_output=True, text=True
+        )
+        return set(linea.split('==')[0].lower() for linea in resultado.stdout.strip().split('\n') if '==' in linea)
+
+    def instalar_paquete(self, paquete):
+        print(f"⬇️ Instalando o actualizando {paquete}...")
+        proceso = subprocess.Popen(
+            [sys.executable, '-m', 'pip', 'install', '--upgrade', paquete],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        stdout, stderr = proceso.communicate()
+        if proceso.returncode != 0:
+            print(f"❌ Fallo instalando {paquete}.")
+            print(stderr.decode(errors='ignore'))
+
+    def instalar_paquetes(self):
+        desactualizados = self.obtener_dependencias_desactualizadas()
+        with multiprocessing.Pool(processes=os.cpu_count()) as pool:
+            pool.map(self.instalar_paquete, desactualizados.union({p for p in self.dependencias if p.lower() not in desactualizados}))
+
+    def ejecutar(self):
+        if not self.tiene_conexion():
+            raise EnvironmentError("❌ No hay conexión a Internet. Aborta operación.")
+        self.comprobar_entorno()
+        self.usar_aria2c = instalar_aria2c_si_falta(self.binarios, self.carpeta_binarios, self.timeout)
+        print("🔍 Validando e instalando dependencias...")
+        self.instalar_paquetes()
+        print("🔍 Validando e instalando binarios externos...")
+        with multiprocessing.Pool(processes=4) as pool:
+            pool.starmap(
+                lambda nombre, url: self.reintentar(descargar_binario, 3, 2, nombre, url, self.carpeta_binarios, self.usar_aria2c, self.timeout),
+                [(nombre, url) for nombre, url in self.binarios.items() if nombre != 'aria2c']
+            )
+        print("🎉 Todas las dependencias están verificadas e instaladas correctamente.")
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Gestor automático de dependencias y binarios')
+    parser.add_argument('--modo', choices=['full', 'solo-paquetes', 'solo-binarios'], default='full')
+    args = parser.parse_args()
+
+    dependencias = [
+        'yt-dlp',
+        'aiohttp',
+        'async-timeout',
+        'python-dotenv',
+        'openai',
+        'beautifulsoup4',
+        'rapidfuzz',
+        'sentence-transformers',
+        'torch',
+        'spacy',
+        'Pillow',
+        'soundfile',
+        'shazamio',
+        'essentia',
+        'openl3',
+        'aiocache',
+        'backoff',
+        'psutil'
+    ]
+
+    binarios = {
+        'aria2c': 'https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-win-64bit-build1.zip',
+        'ffmpeg': 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
+    }
+
+    gestor = InstallerManager(dependencias, binarios)
+
+    try:
+        if args.modo == 'full':
+            gestor.ejecutar()
+        elif args.modo == 'solo-paquetes':
+            gestor.comprobar_entorno()
+            gestor.instalar_paquetes()
+        elif args.modo == 'solo-binarios':
+            gestor.usar_aria2c = instalar_aria2c_si_falta(binarios, gestor.carpeta_binarios, gestor.timeout)
+            with multiprocessing.Pool(processes=4) as pool:
+                pool.starmap(
+                    lambda nombre, url: gestor.reintentar(
+                        descargar_binario, 3, 2, nombre, url, gestor.carpeta_binarios, gestor.usar_aria2c, gestor.timeout
+                    ),
+                    [(nombre, url) for nombre, url in binarios.items() if nombre != 'aria2c']
+                )
+        print("✅ Proceso finalizado con éxito")
+    except Exception as e:
+        print(f"❌ Error crítico: {e}")

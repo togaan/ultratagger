@@ -1,0 +1,301 @@
+# requirements: aiohttp, async-timeout, Pillow, yt-dlp, python-dotenv, beautifulsoup4
+# api_keys: GENIUS_TOKEN, SPOTIFY_TOKEN, DEEZER_API, ITUNES_API_KEY, LASTFM_API_KEY, MUSICBRAINZ_API, MUSIXMATCH_API_KEY, LYRICS_OVH_API, DISCOGS_TOKEN, FANARTTV_KEY, NAPSTER_API_KEY
+
+import os
+import asyncio
+import aiohttp
+import async_timeout
+from urllib.parse import quote
+from yt_dlp import YoutubeDL
+from PIL import Image
+from io import BytesIO
+import dotenv
+import json
+from bs4 import BeautifulSoup
+
+dotenv.load_dotenv()
+
+config = {}
+try:
+    with open("config.json", "r") as file:
+        config = json.load(file)
+except FileNotFoundError:
+    pass
+
+GENIUS_TOKEN = config.get("GENIUS_TOKEN", os.getenv("GENIUS_TOKEN"))
+SPOTIFY_TOKEN = config.get("SPOTIFY_TOKEN", os.getenv("SPOTIFY_TOKEN"))
+DEEZER_API = config.get("DEEZER_API", os.getenv("DEEZER_API"))
+ITUNES_API_KEY = config.get("ITUNES_API_KEY", os.getenv("ITUNES_API_KEY"))
+MUSICBRAINZ_API = config.get("MUSICBRAINZ_API", os.getenv("MUSICBRAINZ_API"))
+MUSIXMATCH_API_KEY = config.get("MUSIXMATCH_API_KEY", os.getenv("MUSIXMATCH_API_KEY"))
+LYRICS_OVH_API = config.get("LYRICS_OVH_API", os.getenv("LYRICS_OVH_API"))
+LASTFM_API_KEY = config.get("LASTFM_API_KEY", os.getenv("LASTFM_API_KEY"))
+DISCOGS_TOKEN = config.get("DISCOGS_TOKEN", os.getenv("DISCOGS_TOKEN"))
+FANARTTV_KEY = config.get("FANARTTV_KEY", os.getenv("FANARTTV_KEY"))
+NAPSTER_API_KEY = config.get("NAPSTER_API_KEY", os.getenv("NAPSTER_API_KEY"))
+
+async def retry_request(session, url, headers=None, attempts=3, delay=2):
+    for attempt in range(attempts):
+        try:
+            async with async_timeout.timeout(5):
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status == 200:
+                        return await resp.text() if 'chartlyrics' in url else await resp.json()
+                    elif resp.status == 429:
+                        await asyncio.sleep((attempt + 1) * delay)
+        except:
+            await asyncio.sleep(delay)
+    return None
+
+class BaseFuenteAPI:
+    def __init__(self, nombre, tipo, token=None):
+        self.nombre = nombre
+        self.tipo = tipo
+        self.token = token
+
+    async def consultar(self, session, url, parser=None):
+        headers = {"Authorization": f"Bearer {self.token}"} if self.token else None
+        resultado = await retry_request(session, url, headers)
+        if resultado and parser:
+            return await parser(session, resultado)
+        return resultado
+
+class ProcesadorImagen:
+    @staticmethod
+    async def validar_resolucion(session, url):
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    img = Image.open(BytesIO(data))
+                    return img.size[0] >= 600 and img.size[1] >= 600
+        except:
+            return False
+        return False
+
+    @staticmethod
+    async def redimensionar(session, url, tamaño=(600, 600)):
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    img = Image.open(BytesIO(data)).resize(tamaño, Image.ANTIALIAS)
+                    return img
+        except:
+            return None
+        return None
+
+async def obtener_portada_y_letra(session, artista, cancion):
+    consultas = [
+        BaseFuenteAPI("spotify", "portada", SPOTIFY_TOKEN),
+        BaseFuenteAPI("deezer", "portada"),
+        BaseFuenteAPI("itunes", "portada"),
+        BaseFuenteAPI("lastfm", "portada"),
+        BaseFuenteAPI("discogs", "portada"),
+        BaseFuenteAPI("fanarttv", "portada"),
+        BaseFuenteAPI("napster", "portada"),
+        BaseFuenteAPI("genius", "letra", GENIUS_TOKEN),
+        BaseFuenteAPI("musixmatch", "letra"),
+        BaseFuenteAPI("lyrics_ovh", "letra"),
+        BaseFuenteAPI("chartlyrics", "letra"),
+        BaseFuenteAPI("lyricsfreak", "letra"),
+        BaseFuenteAPI("songlyrics", "letra")
+    ]
+
+    async def parser(session, nombre, tipo, datos):
+        if tipo == "portada":
+            if nombre == "spotify" and "tracks" in datos:
+                items = datos.get("tracks", {}).get("items")
+                if items:
+                    url = items[0].get("album", {}).get("images", [{}])[0].get("url")
+                    if url and await ProcesadorImagen.validar_resolucion(session, url):
+                        return url
+            if nombre == "deezer" and "data" in datos:
+                for item in datos["data"]:
+                    url = item.get("album", {}).get("cover_big")
+                    if url and await ProcesadorImagen.validar_resolucion(session, url):
+                        return url
+            if nombre == "itunes" and "results" in datos:
+                for item in datos["results"]:
+                    url = item.get("artworkUrl100", "").replace("100x100", "600x600")
+                    if url and await ProcesadorImagen.validar_resolucion(session, url):
+                        return url
+            if nombre == "lastfm" and "track" in datos:
+                imgs = datos["track"].get("album", {}).get("image", [])
+                if imgs:
+                    url = imgs[-1].get("#text")
+                    if url and await ProcesadorImagen.validar_resolucion(session, url):
+                        return url
+            if nombre == "discogs" and "results" in datos:
+                url = datos["results"][0].get("cover_image")
+                if url and await ProcesadorImagen.validar_resolucion(session, url):
+                    return url
+            if nombre == "fanarttv" and any(k in datos for k in ["hdmusiclogo", "musiclogo", "musicbanner"]):
+                for key in ["hdmusiclogo", "musiclogo", "musicbanner"]:
+                    if key in datos:
+                        url = datos[key][0].get("url")
+                        if url and await ProcesadorImagen.validar_resolucion(session, url):
+                            return url
+            if nombre == "napster" and "search" in datos:
+                tracks = datos["search"].get("data", {}).get("tracks", [])
+                if tracks:
+                    album = tracks[0].get("albumId")
+                    url = f"https://direct.rhapsody.com/imageserver/v2/albums/{album}/images/500x500.jpg"
+                    if await ProcesadorImagen.validar_resolucion(session, url):
+                        return url
+
+        if tipo == "letra":
+            if nombre == "genius" and "response" in datos:
+                path = datos["response"]["hits"][0]["result"].get("path")
+                if path:
+                    return f"https://genius.com{path}"
+            if nombre == "musixmatch" and "message" in datos:
+                track = datos["message"]["body"].get("track")
+                if track and track.get("has_lyrics"):
+                    return track.get("track_share_url")
+            if nombre == "lyrics_ovh" and "lyrics" in datos:
+                txt = datos["lyrics"]
+                if len(txt.strip()) > 100:
+                    return txt.strip()
+            if nombre == "chartlyrics" and "<Lyric>" in datos:
+                start = datos.find("<Lyric>")
+                end = datos.find("</Lyric>")
+                if start != -1 and end != -1:
+                    texto = datos[start+7:end].strip()
+                    if len(texto) > 100:
+                        return texto
+            if nombre == "lyricsfreak":
+                soup = BeautifulSoup(datos, "html.parser")
+                link = soup.select_one(".song a")
+                if link:
+                    async with session.get("https://www.lyricsfreak.com" + link.get("href")) as lyr:
+                        html = await lyr.text()
+                        lyr_soup = BeautifulSoup(html, "html.parser")
+                        div = lyr_soup.select_one(".lyrictxt")
+                        if div and len(div.text.strip()) > 100:
+                            return div.text.strip()
+            if nombre == "songlyrics":
+                soup = BeautifulSoup(datos, "html.parser")
+                link = soup.select_one(".serpresult a")
+                if link:
+                    async with session.get(link.get("href")) as lyr:
+                        html = await lyr.text()
+                        lyr_soup = BeautifulSoup(html, "html.parser")
+                        div = lyr_soup.select_one("p#songLyricsDiv")
+                        if div and len(div.text.strip()) > 100:
+                            return div.text.strip()
+        return None
+
+    tareas = [c.consultar(session, f_url(c.nombre, artista, cancion), lambda s, d, n=c.nombre, t=c.tipo: parser(s, n, t, d)) for c in consultas]
+
+    def f_url(nombre, artista, cancion):
+        q = quote(artista + ' ' + cancion)
+        if nombre == "spotify": return f"https://api.spotify.com/v1/search?q={q}&type=track"
+        if nombre == "deezer": return f"https://api.deezer.com/search?q={q}"
+        if nombre == "itunes": return f"https://itunes.apple.com/search?term={q}&limit=1"
+        if nombre == "lastfm": return f"http://ws.audioscrobbler.com/2.0/?method=track.getInfo&api_key={LASTFM_API_KEY}&artist={quote(artista)}&track={quote(cancion)}&format=json"
+        if nombre == "discogs": return f"https://api.discogs.com/database/search?q={q}&token={DISCOGS_TOKEN}"
+        if nombre == "fanarttv": return f"https://webservice.fanart.tv/v3/music/{quote(artista)}?api_key={FANARTTV_KEY}"
+        if nombre == "napster": return f"https://api.napster.com/v2.2/search?apikey={NAPSTER_API_KEY}&query={q}&type=track"
+        if nombre == "genius": return f"https://api.genius.com/search?q={q}"
+        if nombre == "musixmatch": return f"https://api.musixmatch.com/ws/1.1/track.search?q_track={quote(cancion)}&q_artist={quote(artista)}&apikey={MUSIXMATCH_API_KEY}"
+        if nombre == "lyrics_ovh": return f"https://api.lyrics.ovh/v1/{quote(artista)}/{quote(cancion)}"
+        if nombre == "chartlyrics": return f"http://api.chartlyrics.com/apiv1.asmx/SearchLyricDirect?artist={quote(artista)}&song={quote(cancion)}"
+        if nombre == "lyricsfreak": return f"https://www.lyricsfreak.com/search.php?a=search&type=song&q={q}"
+        if nombre == "songlyrics": return f"https://www.songlyrics.com/index.php?section=search&searchW={q}&submit=Search"
+        return ""
+
+    resultados = await asyncio.gather(*tareas)
+    portadas_validas = [(r, c.nombre) for c, r in zip(consultas, resultados) if c.tipo == "portada" and r]
+    portada = await obtener_mejor_portada(session, portadas_validas)
+    letras_validas = [(r, c.nombre) for c, r in zip(consultas, resultados) if c.tipo == "letra" and r]
+    letra = await obtener_mejor_letra(letras_validas)
+    return portada, letra
+class EvaluadorLetras:
+    PESOS_FUENTE = {
+        "genius": 4,
+        "musixmatch": 3,
+        "lyrics_ovh": 2,
+        "lyricsfreak": 2,
+        "chartlyrics": 2,
+        "songlyrics": 2
+    }
+
+    @staticmethod
+    def puntuar(texto, fuente):
+        score = 0
+        if not texto or len(texto.strip()) < 100:
+            return 0
+        l = len(texto.strip())
+        if l > 200: score += 1
+        if l > 500: score += 1
+        if l > 1000: score += 1
+        if texto.count("
+") > 3: score += 1
+        score += EvaluadorLetras.PESOS_FUENTE.get(fuente.lower(), 0)
+        return score
+
+async def obtener_mejor_letra(letras_validas):
+    puntajes = [EvaluadorLetras.puntuar(texto, fuente) for texto, fuente in letras_validas]
+    if not puntajes: return None
+    idx = puntajes.index(max(puntajes))
+    texto_limpio = letras_validas[idx][0]
+    texto_limpio = limpiar_letra_para_ultrastar(texto_limpio)
+    texto_limpio = normalizar_letra(texto_limpio)
+    texto_limpio = verso_por_linea(texto_limpio)
+    return texto_limpio
+
+
+def limpiar_letra_para_ultrastar(texto):
+    lineas = texto.splitlines()
+    filtradas = [l.strip() for l in lineas if l.strip() and not any(k in l.lower() for k in ["http", "www", "lyrics powered", "writer", "embed"])]
+    return "
+".join(filtradas)
+
+def normalizar_letra(texto):
+    import unicodedata
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = texto.replace("“", '"').replace("”", '"').replace("–", "-").replace("’", "'")
+    return texto
+
+def verso_por_linea(texto):
+    return "
+".join(l.strip() for l in texto.splitlines() if l.strip())
+
+
+class EvaluadorPortadas:
+    PESOS_FUENTE = {
+        "spotify": 5,
+        "napster": 5,
+        "fanarttv": 4,
+        "itunes": 3,
+        "discogs": 3,
+        "lastfm": 2,
+        "deezer": 1
+    }
+
+    @staticmethod
+    async def puntuar(session, url, fuente):
+        score = 0
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    img = Image.open(BytesIO(data))
+                    w, h = img.size
+                    if min(w, h) >= 600: score += 1
+                    if min(w, h) >= 1000: score += 1
+                    if min(w, h) >= 1500: score += 1
+                    if abs(w - h) < 10: score += 1
+                    if len(data) > 40000: score += 1
+        except:
+            return 0
+        score += EvaluadorPortadas.PESOS_FUENTE.get(fuente.lower(), 0)
+        return score
+
+async def obtener_mejor_portada(session, candidatas):
+    puntajes = await asyncio.gather(*(EvaluadorPortadas.puntuar(session, url, fuente) for url, fuente in candidatas))
+    if not puntajes: return None
+    idx = puntajes.index(max(puntajes))
+    return candidatas[idx][0] if puntajes[idx] > 0 else None
+

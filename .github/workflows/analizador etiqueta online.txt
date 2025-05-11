@@ -1,0 +1,136 @@
+# requirements: httpx>=0.27.0, python-dotenv>=1.0.0, rapidfuzz>=3.5.2, aiocache>=0.12.2, backoff>=2.2.1
+# api_keys: SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, AUDD_API_KEY, ACR_ACCESS_KEY, ACR_ACCESS_SECRET,
+# DISCOGS_USER_TOKEN, LASTFM_API_KEY, MUSIXMATCH_API_KEY, SETLISTFM_API_KEY, NAPSTER_API_KEY,
+# SEVENDIGITAL_API_KEY, GENIUS_API_KEY, SHAZAM_API_KEY, GRACENOTE_USERID, GRACENOTE_CLIENTID
+
+import os, asyncio, httpx, backoff
+from dotenv import load_dotenv
+from rapidfuzz import process, fuzz
+from collections import Counter
+from aiocache import cached, Cache
+
+load_dotenv()
+CAMPOS = ["autor", "titulo", "álbum", "año", "género", "bpm", "idioma"]
+HEADERS = {"User-Agent": "UltraMaker/1.0"}
+TIMEOUT = 10
+
+def plantilla_campos(): return {k: "" for k in CAMPOS}
+
+def mejor_valor(base, opciones):
+    opciones = [o for o in opciones if o]
+    if not opciones: return ""
+    conteo = Counter(opciones)
+    mas_comun, veces = conteo.most_common(1)[0]
+    if veces > 1: return mas_comun
+    r, _ = process.extractOne(base, opciones, scorer=fuzz.token_sort_ratio, score_cutoff=70)
+    return r or opciones[0]
+
+def mejor_por_campo(base, tareas):
+    return {campo: mejor_valor(base.get(campo, ""), [t.get(campo, "") for t in tareas if isinstance(t, dict)])
+            for campo in CAMPOS}
+
+@backoff.on_exception(backoff.expo, httpx.RequestError, max_tries=3)
+@cached(ttl=600, cache=Cache.MEMORY)
+async def fetch_json(client, url, headers=None, params=None):
+    try:
+        response = await client.get(url, headers=headers or HEADERS, params=params)
+        if response.status_code == 200: return response.json()
+    except: return {}
+    return {}
+
+async def try_wrapper(fn, *args, debug=False):
+    try: return await fn(*args)
+    except Exception as e:
+        if debug: print(f"❌ Error en {fn.__name__}: {e}")
+        return {}
+
+async def metadatos_generico(client, url, campos, params=None, headers=None, path=None):
+    data = await fetch_json(client, url, headers=headers, params=params)
+    for key in path or []:
+        if isinstance(data, dict): data = data.get(key, {})
+        elif isinstance(data, list) and isinstance(key, int) and len(data) > key: data = data[key]
+        else: data = {}
+    return {campo: (data.get(campos.get(campo, ""), "")[:4] if campo == "año" else str(data.get(campos.get(campo, ""), "")))
+            for campo in CAMPOS}
+
+def token(k): return os.getenv(k, "")
+
+def fuente(nombre, url, campos, params_fn, path=None, headers=None):
+    return lambda client, a, t: metadatos_generico(client, url, campos, params_fn(a, t),
+                                                   headers=headers or HEADERS, path=path)
+
+FUENTES = [
+    fuente("deezer", "https://api.deezer.com/search", {"autor": "artist.name", "titulo": "title", "álbum": "album.title", "bpm": "bpm"},
+           lambda a, t: {"q": f"{a} {t}"}, ["data", 0]),
+    fuente("itunes", "https://itunes.apple.com/search", {"autor": "artistName", "titulo": "trackName", "álbum": "collectionName",
+           "año": "releaseDate", "género": "primaryGenreName"}, lambda a, t: {"term": f"{a} {t}", "limit": 1}, ["results", 0]),
+    fuente("musicbrainz", "https://musicbrainz.org/ws/2/recording/",
+           {"autor": "artist-credit.0.name", "titulo": "title", "año": "first-release-date"},
+           lambda a, t: {"query": f'artist:"{a}" AND recording:"{t}"', "fmt": "json", "limit": 1}, ["recordings", 0]),
+    fuente("acrcloud", "https://api.acrcloud.com/v1/metadata/music", {"autor": "artists.0.name", "titulo": "title", "álbum": "album.name",
+           "año": "release_date", "género": "genres.0.name", "bpm": "bpm"}, lambda a, t: {"title": t, "artist": a,
+           "access_key": token("ACR_ACCESS_KEY"), "signature": token("ACR_ACCESS_SECRET")}, ["metadata", "music", 0]),
+    fuente("audd", "https://api.audd.io/findLyrics/", {"autor": "artist", "titulo": "title", "álbum": "album"},
+           lambda a, t: {"q": f"{a} {t}", "api_token": token("AUDD_API_KEY")}, ["result", 0]),
+    fuente("discogs", "https://api.discogs.com/database/search", {"autor": "title", "año": "year", "género": "genre.0"},
+           lambda a, t: {"q": f"{a} {t}", "token": token("DISCOGS_USER_TOKEN")}, ["results", 0]),
+    fuente("lastfm", "http://ws.audioscrobbler.com/2.0/", {"género": "toptags.tag.0.name"},
+           lambda a, t: {"method": "track.gettoptags", "artist": a, "track": t,
+                         "api_key": token("LASTFM_API_KEY"), "format": "json"}),
+    fuente("musixmatch", "https://api.musixmatch.com/ws/1.1/track.search",
+           {"autor": "track.artist_name", "titulo": "track.track_name", "álbum": "track.album_name", "año": "track.first_release_date",
+            "idioma": "track.language"},
+           lambda a, t: {"q_track": t, "q_artist": a, "apikey": token("MUSIXMATCH_API_KEY")},
+           ["message", "body", "track_list", 0, "track"]),
+    fuente("setlistfm", "https://api.setlist.fm/rest/1.0/search/setlists",
+           {"autor": "artist.name", "titulo": "sets.set.0.song.0.name", "año": "eventDate"},
+           lambda a, t: {"artistName": a, "tourName": t}, ["setlist", 0],
+           headers={"x-api-key": token("SETLISTFM_API_KEY"), "Accept": "application/json"}),
+    fuente("theaudiodb", "https://theaudiodb.com/api/v1/json/1/searchtrack.php",
+           {"autor": "strArtist", "titulo": "strTrack", "álbum": "strAlbum", "año": "intYearReleased",
+            "género": "strGenre", "bpm": "intTempo", "idioma": "strLanguage"}, lambda a, t: {"s": a, "t": t}, ["track", 0]),
+    fuente("jiosaavn", "https://www.jiosaavn.com/api.php", {"autor": "artist", "titulo": "title", "álbum": "album",
+           "año": "year", "género": "language", "idioma": "language"},
+           lambda a, t: {"__call": "autocomplete.get", "query": f"{a} {t}", "_format": "json"}, ["songs", 0]),
+    fuente("ytmusic", "https://music.youtube.com/youtubei/v1/search",
+           {"autor": "artists.0.name", "titulo": "title", "álbum": "album.name"}, lambda a, t: {"q": f"{a} {t}"}, ["contents", 0]),
+    fuente("audius", "https://api.audius.co/v1/tracks/search", {"autor": "user.name", "titulo": "title", "álbum": "album"},
+           lambda a, t: {"query": f"{a} {t}"}, ["data", 0]),
+    fuente("jamendo", "https://api.jamendo.com/v3.0/tracks",
+           {"autor": "artist_name", "titulo": "name", "álbum": "album_name", "género": "musicinfo.tags.0"},
+           lambda a, t: {"client_id": "demo_client_id", "format": "json", "limit": 1, "namesearch": f"{a} {t}"}, ["results", 0]),
+    fuente("napster", "https://api.napster.com/v2.2/search", {"autor": "artistName", "titulo": "name", "álbum": "albumName",
+           "año": "originalReleaseDate", "género": "genre"}, lambda a, t: {"apikey": token("NAPSTER_API_KEY"),
+           "query": f"{a} {t}", "type": "track"}, ["search", "data", "tracks", 0]),
+    fuente("beatport", "https://api.beatport.com/v4/catalog/search", {"autor": "artists.0.name", "titulo": "name",
+           "álbum": "release.name", "año": "release.date", "género": "genres.0.name", "bpm": "bpm"},
+           lambda a, t: {"q": f"{a} {t}", "type": "tracks"}, ["results", 0]),
+    fuente("7digital", "https://api.7digital.com/1.2/track/search", {"autor": "artist.name", "titulo": "title",
+           "álbum": "release.title", "año": "release.year", "género": "tags.0.name"},
+           lambda a, t: {"q": f"{a} {t}", "oauth_consumer_key": token("SEVENDIGITAL_API_KEY"), "pageSize": 1},
+           ["searchResults", "searchResult", 0, "track"]),
+    fuente("spotify", "https://api.spotify.com/v1/search", {"autor": "artists.0.name", "titulo": "name",
+           "álbum": "album.name", "año": "album.release_date", "idioma": "available_markets.0"},
+           lambda a, t: {"q": f"track:{t} artist:{a}", "type": "track", "limit": 1},
+           ["tracks", "items", 0], headers={"Authorization": f"Bearer {token('SPOTIFY_BEARER_TOKEN')}"}),
+    fuente("genius", "https://api.genius.com/search", {"autor": "result.primary_artist.name", "titulo": "result.title"},
+           lambda a, t: {"q": f"{a} {t}"}, ["response", "hits", 0], headers={"Authorization": f"Bearer {token('GENIUS_API_KEY')}"}),
+    fuente("freedb", "http://www.freedb.org/freedb_search.php", {"autor": "artist", "titulo": "title"},
+           lambda a, t: {"words": f"{a} {t}"}),
+    fuente("soundcloud", "https://api-v2.soundcloud.com/search/tracks", {"autor": "user.username", "titulo": "title"},
+           lambda a, t: {"q": f"{a} {t}"}, ["collection", 0]),
+    fuente("shazam", "https://api.shazam.com/search", {"autor": "track.subtitle", "titulo": "track.title"},
+           lambda a, t: {"term": f"{a} {t}"}, ["tracks", "hits", 0]),
+    fuente("gracenote", "https://cXXXXXXXXXX.web.cddbp.net/webapi/xml/1.0/album_search", {"autor": "artist", "titulo": "title"},
+           lambda a, t: {"query": f"{a} {t}", "client": token("GRACENOTE_CLIENTID"), "user": token("GRACENOTE_USERID")}),
+    fuente("mbid_allmusic", "https://musicbrainz.org/ws/2/recording/", {"autor": "artist-credit.0.name", "titulo": "title"},
+           lambda a, t: {"query": f"{a} {t}", "fmt": "json"}, ["recordings", 0])
+]
+
+async def obtener_metadatos(entrada, debug=False):
+    artista, titulo = entrada.get("autor", ""), entrada.get("titulo", "")
+    async with httpx.AsyncClient(http2=True, timeout=TIMEOUT) as client:
+        tareas = await asyncio.gather(*[try_wrapper(f, client, artista, titulo, debug=debug) for f in FUENTES],
+                                      return_exceptions=True)
+    return mejor_por_campo(entrada, tareas)
+

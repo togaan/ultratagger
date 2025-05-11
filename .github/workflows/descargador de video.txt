@@ -1,0 +1,92 @@
+# requirements: yt-dlp>=2024.4.0
+# api_keys:
+
+import os
+import re
+import shutil
+import subprocess
+import time
+import argparse
+from urllib.request import urlopen
+from typing import Optional, Tuple
+from yt_dlp import YoutubeDL, DownloadError
+
+class Config:
+    FORMATO_OBJETIVO = "bv*[height<=720][fps<=30][ext=mp4]+ba[ext=m4a]/best[height<=720][fps<=30]"
+    EXTENSION_SALIDA = "mp4"
+    CHUNK_SIZE = "2M"
+    CONCURRENT_FRAGMENTS = 5
+    HTTP2 = True
+    RETRIES = 3
+    OVERWRITE = False
+
+class UltraMakerDownloader:
+    def __init__(self, carpeta_destino: str = "CANCIONES", formato: str = Config.FORMATO_OBJETIVO):
+        self.carpeta_destino = carpeta_destino
+        self.formato = formato
+
+    def slugify(self, text: str) -> str:
+        text = re.sub(r"\s+", "_", text)
+        text = re.sub(r'[\\/*?:"<>|]', "", text)
+        return text[:100]
+
+    def _validar_video(self, ruta: str) -> bool:
+        if not os.path.isfile(ruta) or os.path.getsize(ruta) < 10 * 1024:
+            return False
+        try:
+            out = subprocess.check_output([
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", ruta
+            ], stderr=subprocess.DEVNULL, text=True)
+            return float(out.strip()) > 0.0
+        except Exception:
+            return False
+
+    def _generar_ruta_final(self, info: dict) -> str:
+        titulo = self.slugify(info.get("title", "video"))
+        extension = info.get("ext", Config.EXTENSION_SALIDA)
+        return os.path.join(self.carpeta_destino, f"{titulo}.{extension}")
+
+    def _construir_opciones(self, plantilla_salida: str, verbose: bool, usar_aria2c: bool, sobrescribir: bool) -> dict:
+        opciones = {
+            "format": self.formato,
+            "outtmpl": plantilla_salida,
+            "merge_output_format": Config.EXTENSION_SALIDA,
+            "noplaylist": True,
+            "quiet": not verbose,
+            "nooverwrites": not sobrescribir,
+            "http_chunk_size": Config.CHUNK_SIZE,
+            "retries": Config.RETRIES,
+            "concurrent_fragment_downloads": Config.CONCURRENT_FRAGMENTS,
+            "http2": Config.HTTP2
+        }
+        if usar_aria2c:
+            opciones.update({
+                "external_downloader": "aria2c",
+                "external_downloader_args": ["--summary-interval=0", "-x", "16", "-k", Config.CHUNK_SIZE, "--file-allocation=none"]
+            })
+        return opciones
+
+    def descargar_video(self, url: str, verbose: bool = False, sobrescribir: bool = False) -> Optional[Tuple[str, float]]:
+        plantilla_salida = os.path.join(self.carpeta_destino, "%(title).100s.%(ext)s")
+        usar_aria2c = shutil.which("aria2c") is not None
+        opciones = self._construir_opciones(plantilla_salida, verbose, usar_aria2c, sobrescribir)
+
+        for intento in range(1, Config.RETRIES + 1):
+            try:
+                with YoutubeDL(opciones) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    ruta_final = self._generar_ruta_final(info)
+                    duracion = info.get("duration", 0.0)
+                    if self._validar_video(ruta_final):
+                        return ruta_final, duracion
+                    raise Exception("Archivo descargado inválido")
+            except DownloadError:
+                if intento == Config.RETRIES:
+                    return None
+                time.sleep(2 ** intento)
+            except Exception:
+                if intento == Config.RETRIES:
+                    return None
+                time.sleep(2 ** intento)
+        return None

@@ -1,0 +1,166 @@
+# requirements: yt-dlp shazamio aiohttp openl3 soundfile python-dotenv spleeter essentia acoustid rapidfuzz
+# api_keys: ACRCLOUD_HOST, ACRCLOUD_KEY, ACRCLOUD_SECRET, AUDD_API_KEY, ACOUSTID_KEY
+
+import os
+import re
+import time
+import base64
+import hmac
+import hashlib
+import asyncio
+import random
+import string
+import shutil
+import requests
+import soundfile as sf
+import openl3
+import essentia.standard as es
+from spleeter.separator import Separator
+from shazamio import Shazam
+from yt_dlp import YoutubeDL
+from dotenv import load_dotenv
+from rapidfuzz import fuzz
+from multiprocessing import Pool
+
+load_dotenv()
+ACR = {
+    "host": os.getenv("ACRCLOUD_HOST"),
+    "key": os.getenv("ACRCLOUD_KEY"),
+    "secret": os.getenv("ACRCLOUD_SECRET")
+}
+AUDD_TOKEN = os.getenv("AUDD_API_KEY")
+
+def slugify(s):
+    return re.sub(r"[^\w\-_. ]", "", s)
+
+def descargar_y_convertir(url):
+    os.makedirs("audio", exist_ok=True)
+    nombre = ''.join(random.choices(string.ascii_lowercase, k=10))
+    salida = f"audio/{nombre}.%(ext)s"
+    ydl_opts = {
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "outtmpl": salida,
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
+        "quiet": True
+    }
+    if shutil.which("aria2c"):
+        ydl_opts["external_downloader"] = "aria2c"
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+        title = slugify(info.get("title", nombre))
+        mp3, wav = f"audio/{title}.mp3", f"audio/{title}.wav"
+        data, sr = sf.read(mp3)
+        sf.write(wav, data, sr)
+        return mp3, wav
+    except:
+        return None, None
+
+def try_wrapper(_, fn, arg):
+    try:
+        return fn(arg)
+    except:
+        return None
+
+def analizar_shazam(wav):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    with open(wav, "rb") as f:
+        snippet = f.read(300000)
+    tmp = "temp_snippet.wav"
+    with open(tmp, "wb") as f:
+        f.write(snippet)
+    r = loop.run_until_complete(Shazam().recognize_song(tmp))
+    os.remove(tmp)
+    t = r.get("track", {})
+    return ("Shazam", t.get("subtitle", ""), t.get("title", ""), "", "", "", "", "")
+
+def analizar_audd(mp3):
+    with open(mp3, 'rb') as f:
+        r = requests.post("https://api.audd.io/", data={"api_token": AUDD_TOKEN}, files={"file": f})
+    t = r.json().get("result", {})
+    return ("AudD", t.get("artist", ""), t.get("title", ""), t.get("album", ""),
+            t.get("release_date", "")[:4], t.get("genre", ""), "", "")
+
+def analizar_acrcloud(mp3):
+    ts = str(int(time.time()))
+    s = f"POST\n/v1/identify\n{ACR['key']}\naudio\n1\n{ts}"
+    sig = base64.b64encode(hmac.new(ACR["secret"].encode(), s.encode(), hashlib.sha1).digest()).decode()
+    with open(mp3, "rb") as f:
+        sample = f.read(10 * 1024 * 1024)
+    r = requests.post(f"https://{ACR['host']}/v1/identify",
+                      files={"sample": sample},
+                      data={"access_key": ACR["key"], "sample_bytes": str(len(sample)),
+                            "timestamp": ts, "signature": sig, "data_type": "audio",
+                            "signature_version": "1"})
+    m = r.json().get("metadata", {}).get("music", [{}])[0]
+    return ("ACRCloud", m.get("artists", [{}])[0].get("name", ""), m.get("title", ""),
+            m.get("album", {}).get("name", ""), m.get("release_date", "")[:4],
+            m.get("genres", [{}])[0].get("name", ""), m.get("bpm", ""), "")
+
+def analizar_openl3(wav):
+    data, sr = sf.read(wav)
+    openl3.get_audio_embedding(data, sr, input_repr="mel256", content_type="music", embedding_size=512)
+    return ("OpenL3", "", "", "", "", "OpenL3", "", "")
+
+def analizar_essentia(wav):
+    audio = es.MonoLoader(filename=wav)()
+    bpm, *_ = es.RhythmExtractor2013(method="multifeature")(audio)
+    tonal = es.TonalExtractor()(audio)
+    return ("Essentia", "", "", "", "", tonal.get("scale", ""), int(bpm), "")
+
+def analizar_musicnn(wav):
+    model = es.TensorflowPredictMusiCNN(modelFilename="musicnn/msd-musicnn-1.pb", output="embedding")
+    model(es.MonoLoader(filename=wav)())
+    return ("Musicnn", "", "", "", "", "Musicnn", "", "")
+
+def analizar_spleeter(wav):
+    Separator("spleeter:2stems").separate_to_file(wav, "spleet_out")
+    return ("Spleeter", "", "", "", "", "", "", "")
+
+METODOS_ANALISIS = {
+    "Shazam": {"func": analizar_shazam, "tipo": "wav", "fase": "rapida"},
+    "AudD": {"func": analizar_audd, "tipo": "mp3", "fase": "rapida"},
+    "ACRCloud": {"func": analizar_acrcloud, "tipo": "mp3", "fase": "rapida"},
+    "OpenL3": {"func": analizar_openl3, "tipo": "wav", "fase": "profunda"},
+    "Essentia": {"func": analizar_essentia, "tipo": "wav", "fase": "profunda"},
+    "Musicnn": {"func": analizar_musicnn, "tipo": "wav", "fase": "profunda"},
+    "Spleeter": {"func": analizar_spleeter, "tipo": "wav", "fase": "profunda"}
+}
+
+def ejecutar_fase(fase, mp3, wav):
+    entradas = []
+    for nombre, data in METODOS_ANALISIS.items():
+        if data["fase"] == fase:
+            arg = wav if data["tipo"] == "wav" else mp3
+            entradas.append((nombre, data["func"], arg))
+    with Pool(len(entradas)) as pool:
+        return [pool.apply_async(try_wrapper, args=entrada).get(timeout=30) for entrada in entradas]
+
+def evaluar_resultados(resultados):
+    resultados = [r for r in resultados if r]
+    for r in resultados:
+        r += (fuzz.token_sort_ratio(f"{r[1]} {r[2]}", f"{r[1]} {r[2]}"),)
+    return sorted(resultados, key=lambda x: x[-1], reverse=True)
+
+def generar_tabla(resultados):
+    print("| MÉTODO   | AUTOR     | TÍTULO    | ÁLBUM     | AÑO  | GÉNERO | BPM  | IDIOMA |")
+    print("|" + "-" * 78 + "|")
+    for r in resultados:
+        print(f"| {r[0]:<8} | {r[1]:<9} | {r[2]:<9} | {r[3]:<9} | {r[4]:<4} | {r[5]:^7} | {r[6]:^4} | {r[7]:^6} |")
+    print("|" + "-" * 78 + "|")
+
+def main_controller(url):
+    mp3, wav = descargar_y_convertir(url)
+    if not mp3 or not wav:
+        return
+    r1 = ejecutar_fase("rapida", mp3, wav)
+    mejores = evaluar_resultados(r1)
+    resultados = r1 + ejecutar_fase("profunda", mp3, wav) if not mejores or mejores[0][-1] < 70 else r1
+    generar_tabla(evaluar_resultados(resultados))
+    if os.path.exists(wav):
+        os.remove(wav)
+
+if __name__ == "__main__":
+    url = input("Introduce URL de YouTube: ").strip()
+    main_controller(url)

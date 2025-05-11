@@ -1,0 +1,25 @@
+# requirements: yt-dlp>=2023.12.30
+
+import subprocess, sys, shutil
+
+def try_wrapper(func, *args, **kwargs):
+    try:
+        return func(*args, **kwargs)
+    except Exception as e:
+        return f"Excepción: {e}"
+
+def instalar_yt_dlp():
+    if not shutil.which("yt-dlp"):
+        subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"], check=True)
+
+def get_video_title(url):
+    instalar_yt_dlp()
+    resultado = subprocess.run(
+        ["yt-dlp", "--get-title", url],
+        capture_output=True,
+        text=True,
+        timeout=20
+    )
+    if resultado.returncode == 0:
+        return resultado.stdout.strip()
+    return "Error al obtener el título"

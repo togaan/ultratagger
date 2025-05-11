@@ -1,0 +1,66 @@
+# requirements: rapidfuzz>=3.5.2, sentence-transformers>=2.2.2, torch>=2.0.1, spacy>=3.7.2
+# api_keys: (no requiere)
+
+__all__ = ["parse_title_author"]
+
+import re, concurrent.futures
+from rapidfuzz import fuzz
+from sentence_transformers import SentenceTransformer, util
+
+try:
+    import spacy
+    nlp = spacy.load("en_core_web_sm")
+except:
+    nlp = None
+
+_modelo = SentenceTransformer("all-MiniLM-L6-v2")
+_strip = str.strip
+_sub = lambda p, r, t, flags=0: re.sub(p, r, t, flags=flags)
+
+def _limpiar(t): return _sub(r'[\[\(].*?[\]\)]', '', t).strip()
+
+def _score_semantic(a, t):
+    va, vt = _modelo.encode([f"{a} - artista", f"{t} - título"], convert_to_tensor=True)
+    return float(util.cos_sim(va, vt))
+
+def _valido(r):
+    if not r or not isinstance(r, tuple): return 0
+    a, t = r
+    if not a or not t or len(a) > 50 or len(t) > 150: return 0
+    if any(x in a.lower() for x in ["video", "official", "lyrics", "feat"]): return 0
+    return 1
+
+def _consenso_semantico(pares):
+    validados = [((a, t), _score_semantic(a, t)) for a, t in pares]
+    validados.sort(key=lambda x: x[1], reverse=True)
+    return {"autor": validados[0][0][0], "titulo": validados[0][0][1]} if validados else {"autor": "Desconocido", "titulo": "Desconocido"}
+
+def parse_title_author(titulo):
+    metodos = [
+        lambda t: tuple(map(_strip, t.split(" - ", 1))) if " - " in t else None,
+        lambda t: (m := re.match(r'^(.+?)\s*-\s*(.+)', _limpiar(t))) and tuple(map(_strip, m.groups())),
+        lambda t: (p := t.split(" - ")) and len(p) == 2 and (_strip(p[1]), _strip(p[0])),
+        lambda t: (x := _limpiar(t).split()) and len(x) >= 2 and (x[0], " ".join(x[1:])),
+        lambda t: (p := re.split(r" - | – ", _limpiar(t))) and len(p) == 3 and (_strip(p[0]), f"{_strip(p[1])} - {_strip(p[2])}"),
+        lambda t: (p := _limpiar(t).split("-")) and len(p) == 2 and len(p[0].split()) <= 4 and (_strip(p[0]), _strip(p[1])),
+        lambda t: (p := t.split(" - ", 1)) and len(p) == 2 and p[0].istitle() and (_strip(p[0]), _strip(p[1])),
+        lambda t: (p := t.split(",")) and len(p) == 2 and (_strip(p[1]), _strip(p[0])),
+        lambda t: (p := t.split(":")) and len(p) == 2 and (_strip(p[0]), _strip(p[1])),
+        lambda t: (p := t.split(" – ")) and len(p) == 2 and (_strip(p[0]), _strip(p[1])),
+        lambda t: (p := t.split(" / ")) and len(p) == 2 and (_strip(p[0]), _strip(p[1])),
+        lambda t: (p := _sub(r'\(.*?\)|\[.*?\]', '', t)) and " - " in p and tuple(map(_strip, p.split(" - ", 1))),
+        lambda t: (x := _limpiar(t).split()) and (i := next((i for i, w in enumerate(x[1:], 1) if w.istitle()), -1)) > 0 and (" ".join(x[:i]), " ".join(x[i:])),
+        lambda t: (x := _limpiar(t).split()) and len(x) >= 4 and len(x[0]) < 20 and (x[0], " ".join(x[1:])),
+        lambda t: (x := _limpiar(t).split()) and len(x) > 4 and (x[-1], " ".join(x[:-1])),
+        lambda t: (p := re.split(r"(feat\.|ft\.|Feat\.|Ft\.)", t, 1)) and " - " in p[0] and tuple(map(_strip, p[0].split(" - ", 1))),
+        lambda t: (p := _sub(r'\b(official|video|lyrics|cover|remix|edit|instrumental|karaoke|audio|prod\.?)\b', '', t, flags=re.I)) and " - " in p and tuple(map(_strip, p.split(" - ", 1))),
+        lambda t: (p := t.split(" - ")) and len(p) == 2 and (_strip(p[0]), _strip(p[1])) if len(p[0]) < len(p[1]) else (_strip(p[1]), _strip(p[0])) if len(p) == 2 else None,
+        lambda t: (p := t.split(" - ")) and len(p) == 2 and (_strip(p[0]), _strip(p[1])) if sum(ord(c) < 128 for c in p[0]) >= sum(ord(c) < 128 for c in p[1]) else (_strip(p[1]), _strip(p[0])) if len(p) == 2 else None,
+        lambda t: (x := _limpiar(t).split()) and x[0][0].isupper() and (x[0], " ".join(x[1:])),
+        lambda t: nlp and (ents := [ent for ent in nlp(t).ents if ent.label_ == "PERSON"]) and (ents[0].text, t.replace(ents[0].text, '').strip())
+    ]
+
+    with concurrent.futures.ThreadPoolExecutor() as ex:
+        resultados = [f.result() for f in concurrent.futures.as_completed([ex.submit(m, titulo) for m in metodos])]
+
+    return _consenso_semantico([r for r in resultados if _valido(r)])

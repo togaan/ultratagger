@@ -1,0 +1,110 @@
+# requirements: ffmpeg, python 3.8+, psutil
+# api_keys:
+
+import subprocess
+import threading
+import os
+import psutil
+
+EXTENSIONES_VALIDAS = (".mp4", ".mkv", ".webm", ".mov", ".flv", ".avi", ".m4a", ".mp3", ".wav")
+
+def _ejecutar_ffmpeg(command, timeout=120):
+    try:
+        proceso = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        )
+        psutil.Process(proceso.pid).nice(psutil.HIGH_PRIORITY_CLASS)
+        stdout, stderr = proceso.communicate(timeout=timeout)
+        if proceso.returncode != 0:
+            return False, stderr.strip()
+        return True, stdout.strip()
+    except subprocess.TimeoutExpired:
+        proceso.kill()
+        return False, "Tiempo de ejecución superado. Proceso cancelado."
+    except Exception as e:
+        return False, str(e)
+
+def _convertir_video(input_file, output_file):
+    command = [
+        "ffmpeg", "-hide_banner", "-y",
+        "-threads", "6", "-thread_type", "slice",
+        "-i", input_file,
+        "-an",
+        "-vf", "scale=-2:720,fps=30",
+        "-c:v", "h264_amf",
+        "-b:v", "1500k", "-rc", "cbr",
+        "-quality", "speed", "-usage", "transcoding",
+        "-g", "60", "-bf", "2",
+        "-profile", "main", "-level", "auto",
+        "-movflags", "+faststart",
+        "-max_muxing_queue_size", "1024",
+        output_file
+    ]
+    return _ejecutar_ffmpeg(command)
+
+def _convertir_audio(input_file, output_file):
+    command = [
+        "ffmpeg", "-hide_banner", "-y",
+        "-threads", "6",
+        "-i", input_file,
+        "-vn",
+        "-acodec", "libmp3lame",
+        "-b:a", "192k",
+        "-ar", "44100",
+        "-ac", "2",
+        output_file
+    ]
+    return _ejecutar_ffmpeg(command)
+
+def convertir_archivo_ultrastar(input_file, nombre_base=None):
+    if not os.path.isfile(input_file):
+        return False, {"error": f"Archivo no encontrado: {input_file}"}
+    if not input_file.lower().endswith(EXTENSIONES_VALIDAS):
+        return False, {"error": "Extensión no compatible. Usa un archivo de audio o vídeo válido."}
+    if not nombre_base:
+        nombre_base = os.path.splitext(os.path.basename(input_file))[0]
+
+    output_video = f"{nombre_base}_ultrastar_720p.mp4"
+    output_audio = f"{nombre_base}_ultrastar.mp3"
+
+    resultado = {"audio": None, "video": None}
+    def run_audio(): resultado["audio"] = _convertir_audio(input_file, output_audio)
+    def run_video(): resultado["video"] = _convertir_video(input_file, output_video)
+
+    h_audio = threading.Thread(target=run_audio)
+    h_video = threading.Thread(target=run_video)
+    h_audio.start()
+    h_video.start()
+    h_audio.join()
+    h_video.join()
+
+    errores = {}
+    if not resultado["video"][0]:
+        errores["video"] = resultado["video"][1]
+    if not resultado["audio"][0]:
+        errores["audio"] = resultado["audio"][1]
+
+    if errores:
+        return False, errores
+    return True, {"video": output_video, "audio": output_audio}
+
+def main():
+    archivo = input("🎵 Introduce el archivo de entrada (vídeo o audio): ").strip()
+    ok, salida = convertir_archivo_ultrastar(archivo)
+    if ok:
+        print(f"\n✅ Conversión completada:\n🎬 {salida['video']}\n🎧 {salida['audio']}")
+    else:
+        print("\n⚠️ Conversión fallida:")
+        if "error" in salida:
+            print(f"❌ {salida['error']}")
+        if "video" in salida:
+            print(f"❌ Error vídeo:\n{salida['video']}")
+        if "audio" in salida:
+            print(f"❌ Error audio:\n{salida['audio']}")
+
+if __name__ == "__main__":
+    main()
