@@ -1,110 +1,296 @@
-# requirements: ffmpeg, python 3.8+, psutil
-# api_keys:
-
-import subprocess
-import threading
+#!/usr/bin/env python3
+"""
+UltraStar Converter Library
+Requirements: python>=3.8, ffmpeg>=4.4.0, psutil, tqdm, tenacity
+"""
 import os
+import sys
+import re
+import shutil
+import subprocess
+import signal
+import threading
+import time
+from typing import Tuple, List, Dict, Any
+from urllib.request import Request, urlopen
 import psutil
+from yt_dlp import YoutubeDL
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tqdm import tqdm
+import argparse
+import argcomplete
 
-EXTENSIONES_VALIDAS = (".mp4", ".mkv", ".webm", ".mov", ".flv", ".avi", ".m4a", ".mp3", ".wav")
 
-def _ejecutar_ffmpeg(command, timeout=120):
-    try:
-        proceso = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-        )
-        psutil.Process(proceso.pid).nice(psutil.HIGH_PRIORITY_CLASS)
-        stdout, stderr = proceso.communicate(timeout=timeout)
-        if proceso.returncode != 0:
-            return False, stderr.strip()
-        return True, stdout.strip()
-    except subprocess.TimeoutExpired:
-        proceso.kill()
-        return False, "Tiempo de ejecución superado. Proceso cancelado."
-    except Exception as e:
-        return False, str(e)
+# --- Signal Handler ---
+def handle_sigint(signum: int, frame: Any) -> None:
+    """Terminate child processes and clean up temp files on SIGINT"""
+    proc: psutil.Process = psutil.Process(os.getpid())
+    for child in proc.children(recursive=True):
+        try:
+            child.terminate()
+            child.wait(timeout=3)
+        except Exception:
+            child.kill()
+    Utils.cleanup_temp_files(os.getcwd())
+    sys.exit(1)
 
-def _convertir_video(input_file, output_file):
-    command = [
-        "ffmpeg", "-hide_banner", "-y",
-        "-threads", "6", "-thread_type", "slice",
-        "-i", input_file,
-        "-an",
-        "-vf", "scale=-2:720,fps=30",
-        "-c:v", "h264_amf",
-        "-b:v", "1500k", "-rc", "cbr",
-        "-quality", "speed", "-usage", "transcoding",
-        "-g", "60", "-bf", "2",
-        "-profile", "main", "-level", "auto",
-        "-movflags", "+faststart",
-        "-max_muxing_queue_size", "1024",
-        output_file
-    ]
-    return _ejecutar_ffmpeg(command)
+signal.signal(signal.SIGINT, handle_sigint)
 
-def _convertir_audio(input_file, output_file):
-    command = [
-        "ffmpeg", "-hide_banner", "-y",
-        "-threads", "6",
-        "-i", input_file,
-        "-vn",
-        "-acodec", "libmp3lame",
-        "-b:a", "192k",
-        "-ar", "44100",
-        "-ac", "2",
-        output_file
-    ]
-    return _ejecutar_ffmpeg(command)
 
-def convertir_archivo_ultrastar(input_file, nombre_base=None):
-    if not os.path.isfile(input_file):
-        return False, {"error": f"Archivo no encontrado: {input_file}"}
-    if not input_file.lower().endswith(EXTENSIONES_VALIDAS):
-        return False, {"error": "Extensión no compatible. Usa un archivo de audio o vídeo válido."}
-    if not nombre_base:
-        nombre_base = os.path.splitext(os.path.basename(input_file))[0]
+# --- Progress Hook ---
+class ProgressBar:
+    """Single-progress hook for yt-dlp using tqdm"""
+    def __init__(self) -> None:
+        self.bar: tqdm = None  # type: ignore
 
-    output_video = f"{nombre_base}_ultrastar_720p.mp4"
-    output_audio = f"{nombre_base}_ultrastar.mp3"
+    def __call__(self, d: Dict[str, Any]) -> None:
+        if d.get('status') == 'downloading':
+            total: int = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
+            downloaded: int = d.get('downloaded_bytes', 0)
+            if total and not self.bar:
+                self.bar = tqdm(total=total, unit='B', unit_scale=True)
+            if self.bar:
+                self.bar.update(downloaded - self.bar.n)
+        elif d.get('status') == 'finished' and self.bar:
+            self.bar.close()
+            self.bar = None
 
-    resultado = {"audio": None, "video": None}
-    def run_audio(): resultado["audio"] = _convertir_audio(input_file, output_audio)
-    def run_video(): resultado["video"] = _convertir_video(input_file, output_video)
+progress_hook: ProgressBar = ProgressBar()
 
-    h_audio = threading.Thread(target=run_audio)
-    h_video = threading.Thread(target=run_video)
-    h_audio.start()
-    h_video.start()
-    h_audio.join()
-    h_video.join()
 
-    errores = {}
-    if not resultado["video"][0]:
-        errores["video"] = resultado["video"][1]
-    if not resultado["audio"][0]:
-        errores["audio"] = resultado["audio"][1]
+# --- Slug Generator ---
+class SlugGenerator:
+    """Generate unique file-safe slugs"""
+    def __init__(self, dest: str) -> None:
+        self.dest: str = dest
 
-    if errores:
-        return False, errores
-    return True, {"video": output_video, "audio": output_audio}
+    @staticmethod
+    def slugify(text: str) -> str:
+        """Sanitize text into a filesystem-safe slug"""
+        base: str = re.sub(r"[^\w\- ]", "", text).strip().lower()
+        base = re.sub(r"[\s\-]+", "_", base).replace('.', '')
+        return base[:100] or "media"
 
-def main():
-    archivo = input("🎵 Introduce el archivo de entrada (vídeo o audio): ").strip()
-    ok, salida = convertir_archivo_ultrastar(archivo)
-    if ok:
-        print(f"\n✅ Conversión completada:\n🎬 {salida['video']}\n🎧 {salida['audio']}")
+    def make_slug(self, text: str, ext: str) -> str:
+        """Ensure slug is unique in destination directory"""
+        base: str = self.slugify(text)
+        slug: str = base
+        i: int = 1
+        while os.path.exists(os.path.join(self.dest, f"{slug}.{ext}")):
+            slug = f"{base}_{i}"
+            i += 1
+        return slug
+
+
+# --- Utilities ---
+class Utils:
+    """Utility functions for cleanup and folder creation"""
+    @staticmethod
+    def cleanup_temp_files(path: str) -> None:
+        """Remove temporary download files (.part, .tmp) in given path"""
+        for fname in os.listdir(path):
+            if fname.endswith(('.part', '.tmp')):
+                try:
+                    os.remove(os.path.join(path, fname))
+                except Exception:
+                    pass
+
+    @staticmethod
+    def create_artist_folder(dest: str, artist: str, title: str) -> str:
+        """Create a sanitized artist-title folder"""
+        safe_artist: str = SlugGenerator.slugify(artist) if artist else ''
+        safe_title: str = SlugGenerator.slugify(title)
+        folder_name: str = f"{safe_artist}-{safe_title}" if safe_artist else safe_title
+        folder: str = os.path.join(dest, folder_name)
+        os.makedirs(folder, exist_ok=True)
+        return folder
+
+
+# --- Network Calibrator ---
+class NetworkCalibrator:
+    """Measure bandwidth over sample URLs to adjust chunk size and concurrency"""
+    @staticmethod
+    def calibrate(urls: List[str]) -> Tuple[str, int]:
+        speeds: List[float] = []
+        for u in urls[:5]:
+            try:
+                req: Request = Request(u)
+                req.add_header('Range', f"bytes=0-{256*1024-1}")
+                t0: float = time.time()
+                _ = urlopen(req, timeout=15).read()
+                dt: float = max(time.time() - t0, 1e-6)
+                speeds.append((256*1024) / dt)
+            except Exception:
+                continue
+        if not speeds:
+            raise RuntimeError("Calibration failed: no speed samples.")
+        avg: float = sum(speeds) / len(speeds)
+        if avg > 5e6:
+            return '4M', min(psutil.cpu_count(logical=False) or 4, 6)
+        return '1M', min(psutil.cpu_count(logical=False) or 2, 4)
+
+
+# --- Thumbnail Downloader ---
+class ThumbnailDownloader:
+    """Download and validate thumbnails with retries"""
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential())
+    def download(self, url: str) -> bytes:
+        r = urlopen(Request(url), timeout=15)
+        data: bytes = r.read()
+        if data[:3] != b'\xFF\xD8\xFF':
+            raise RuntimeError("Invalid thumbnail format.")
+        return data
+
+
+# --- Media Processor ---
+class MediaProcessor:
+    """Media conversion utilities using ffmpeg"""
+    @staticmethod
+    def check_hw_codec() -> str:
+        """Detect available hardware H.264 encoder"""
+        try:
+            out: str = subprocess.check_output(['ffmpeg', '-encoders'], text=True)
+            for c in ['h264_nvenc', 'h264_amf', 'h264_qsv']:
+                if c in out:
+                    return c
+        except Exception:
+            pass
+        return 'libx264'
+
+    @staticmethod
+    def convert_to_mp3(input_path: str, output_path: str, duration: float, bitrate: str) -> None:
+        """Convert media to MP3 with timeout based on duration and specified bitrate"""
+        timeout: float = max(30, duration * 1.5)
+        subprocess.run([
+            'ffmpeg', '-hwaccel', 'auto', '-y', '-i', input_path,
+            '-vn', '-acodec', 'libmp3lame', '-b:a', bitrate,
+            '-threads', str(psutil.cpu_count(logical=False) or 2), output_path
+        ], check=True, timeout=timeout,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# --- Core Downloader ---
+class UltraMakerCore:
+    """Core class orchestrating download and post-processing"""
+    def __init__(
+        self, dest: str, quiet: bool, overwrite: bool,
+        bitrate: str, fmt: str, quality: str
+    ) -> None:
+        """Initialize core with output settings"""
+        self.dest: str = dest
+        self.quiet: bool = quiet
+        self.overwrite: bool = overwrite
+        self.bitrate: str = bitrate
+        cur_fmt: str = fmt if fmt else 'bestvideo[height<=720]+bestaudio'
+        if quality != 'best':
+            cur_fmt = f"bestvideo[height<={quality}]+bestaudio"
+        self.format: str = cur_fmt
+        self.slug_gen: SlugGenerator = SlugGenerator(dest)
+        self.thumb_dl: ThumbnailDownloader = ThumbnailDownloader()
+        self.aria2c: bool = bool(shutil.which('aria2c'))
+        os.makedirs(dest, exist_ok=True)
+
+    def _start_watchdog(self, pid: int) -> None:
+        """Kill process if still running after timeout"""
+        def watch() -> None:
+            time.sleep(300)
+            if psutil.pid_exists(pid):
+                psutil.Process(pid).kill()
+        threading.Thread(target=watch, daemon=True).start()
+
+    @retry(
+        stop=stop_after_attempt(3), wait=wait_exponential(),
+        retry=retry_if_exception_type(RuntimeError)
+    )
+    def execute_download(self, url: str) -> Tuple[str, float]:
+        """Download media, convert, and organize for UltraStar"""
+        opts: Dict[str, Any] = {
+            'format': self.format,
+            'merge_output_format': 'mp4',
+            'outtmpl': os.path.join(self.dest, '%(id)s.%(ext)s'),
+            'socket_timeout': 15,
+            'quiet': self.quiet,
+            'nooverwrites': not self.overwrite,
+            'progress_hooks': [] if self.quiet else [progress_hook]
+        }
+        if self.aria2c:
+            info_json = YoutubeDL({'format': self.format, 'quiet': True}).extract_info(url, download=False)
+            formats: List[Dict[str, Any]] = info_json.get('formats', [])
+            chunk, frags = NetworkCalibrator.calibrate([f['url'] for f in formats])
+            aria2c_args: List[str] = [
+                f'--max-connection-per-server={frags}',
+                f'--min-split-size={chunk}'
+            ]
+            opts.update({
+                'external_downloader': 'aria2c',
+                'external_downloader_args': aria2c_args
+            })
+        else:
+            try:
+                flat = YoutubeDL({'format': self.format, 'quiet': True, 'extract_flat': 'in_playlist'}).extract_info(url, download=False)
+                format_urls: List[str] = [f['url'] for f in flat.get('formats', []) if f.get('url')]
+                if format_urls:
+                    chunk, _ = NetworkCalibrator.calibrate(format_urls)
+                    opts['http_chunk_size'] = chunk
+            except Exception:
+                pass
+        with YoutubeDL(opts) as ydl:
+            self._start_watchdog(os.getpid())
+            info: Dict[str, Any] = ydl.extract_info(url, download=True)
+        raw: str = info.get('title', 'media')
+        dur: float = info.get('duration', 0.0)
+        ext: str = info.get('ext', 'mp4')
+        slug: str = self.slug_gen.make_slug(raw, ext)
+        init_file: str = os.path.join(self.dest, f"{info.get('id')}.{ext}")
+        artist, title = raw.split(' - ', 1) if ' - ' in raw else ('', raw)
+        folder: str = Utils.create_artist_folder(self.dest, artist, title)
+        final_media: str = os.path.join(folder, f"{slug}.{ext}")
+        shutil.move(init_file, final_media)
+        mp3_path: str = os.path.join(folder, f"{slug}.mp3")
+        MediaProcessor.convert_to_mp3(final_media, mp3_path, dur, self.bitrate)
+        thumb: str = info.get('thumbnail', '')
+        if thumb:
+            data: bytes = self.thumb_dl.download(thumb)
+            tmp: str = os.path.join(self.dest, f"{slug}.jpg")
+            with open(tmp, 'wb') as f:
+                f.write(data)
+            shutil.move(tmp, os.path.join(folder, 'cover.jpg'))
+        Utils.cleanup_temp_files(self.dest)
+        return mp3_path, dur
+
+
+# --- CLI Entry Point ---
+def main() -> None:
+    parser = argparse.ArgumentParser(description='UltraStar Converter Library')
+    parser.add_argument('url', help='URL to download')
+    parser.add_argument('-d', '--dest', default='CANCIONES', help='Output directory')
+    parser.add_argument('-q', '--quiet', action='store_true', help='Suppress progress output')
+    parser.add_argument('-o', '--overwrite', action='store_true', help='Overwrite existing files')
+    parser.add_argument('--bitrate', default='192k', help='Audio bitrate for MP3')
+    parser.add_argument('--format', dest='fmt', default='', help='yt-dlp format string')
+    parser.add_argument('--quality', choices=['best', '720', '480'], default='best', help='Max video height')
+    parser.add_argument('--batch-file', help='File with list of URLs')
+    argcomplete.autocomplete(parser)
+    args = parser.parse_args()
+
+    core = UltraMakerCore(args.dest, args.quiet, args.overwrite,
+                          args.bitrate, args.fmt, args.quality)
+    if args.batch_file:
+        with open(args.batch_file) as f:
+            for line in f:
+                url: str = line.strip()
+                try:
+                    out, dur = core.execute_download(url)
+                    print(f"✅ {out} ({dur:.2f}s)")
+                except Exception as e:
+                    print(f"❌ {url}: {e}")
     else:
-        print("\n⚠️ Conversión fallida:")
-        if "error" in salida:
-            print(f"❌ {salida['error']}")
-        if "video" in salida:
-            print(f"❌ Error vídeo:\n{salida['video']}")
-        if "audio" in salida:
-            print(f"❌ Error audio:\n{salida['audio']}")
+        try:
+            out, dur = core.execute_download(args.url)
+            print(f"✅ {out} ({dur:.2f}s)")
+        except Exception as e:
+            print(f"❌ {e}")
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()

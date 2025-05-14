@@ -1,0 +1,717 @@
+# music_extractor.py - v10.0 FINAL (Unified ES/EN with Enhanced Heuristics, CLI, and Production Features)
+# requirements: yt-dlp>=2023.12.30, requests>=2.28.0, python-dotenv>=1.0.0, cachetools>=5.0.0
+# optional: prometheus_client>=0.15.0, sentence-transformers>=2.2.2, torch>=2.0.1, spacy>=3.7.2
+# usage: python music_extractor.py [-u URL | -f FILE] [-o OUTPUT] [--semantic]
+
+import re
+import json
+import logging
+import subprocess
+import os
+import sys
+import shutil
+import requests
+import argparse
+from urllib.parse import urlparse
+from dataclasses import dataclass
+from typing import Tuple, Dict, Any, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter
+from dotenv import load_dotenv
+from cachetools import TTLCache, cached
+
+# Optional dependencies
+try:
+    from prometheus_client import Counter, Histogram
+except ImportError:
+    Counter = Histogram = None
+
+try:
+    from sentence_transformers import SentenceTransformer, util
+    import torch
+except ImportError:
+    SentenceTransformer = util = torch = None
+
+try:
+    import spacy
+except ImportError:
+    spacy = None
+
+# Logging setup
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Prometheus metrics
+parse_requests_total = Counter('youtube_music_extract_total', 'Total music extraction attempts') if Counter else None
+parse_failed_total = Counter('youtube_music_extract_failed_total', 'Failed music extractions') if Counter else None
+parse_method_total = Counter('youtube_music_extract_by_method', 'Extraction outcomes by method', ['method']) if Counter else None
+parse_heuristic_total = Counter('youtube_music_heuristic_selected', 'Heuristics selected for final result', ['heuristic']) if Counter else None
+parse_duration_hist = Histogram('youtube_music_extract_duration_seconds', 'Duration of music extraction') if Histogram else None
+
+# Session for HTTP requests
+session = requests.Session()
+
+# Caches
+metadata_cache = TTLCache(maxsize=256, ttl=600)  # 10-minute TTL
+dbpedia_cache = TTLCache(maxsize=100, ttl=600)
+
+# Optional spaCy NER
+nlp = None
+if spacy:
+    try:
+        nlp = spacy.load("en_core_web_sm")
+    except Exception as e:
+        logger.warning(f"spaCy model load failed, NER disabled: {e}")
+
+# Optional SentenceTransformer model
+semantic_model = None
+if SentenceTransformer and torch:
+    try:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        semantic_model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
+        if device == 'cpu':
+            semantic_model = torch.quantization.quantize_dynamic(
+                semantic_model, {torch.nn.Linear}, dtype=torch.qint8
+            )
+        logger.info(f"Loaded SentenceTransformer on {device} with quantization")
+    except Exception as e:
+        logger.warning(f"SentenceTransformer load failed, semantic scoring disabled: {e}")
+        semantic_model = None
+
+class YouTubeMusicExtractor:
+    """Extracts music metadata (artist, title) from YouTube URLs using advanced heuristics.
+
+    Args:
+        enable_audio_analysis (bool): Placeholder for future audio analysis.
+        enable_semantic_scoring (bool): Enables SentenceTransformer scoring if available.
+    """
+    def __init__(self, enable_audio_analysis: bool = False, enable_semantic_scoring: bool = False):
+        load_dotenv()
+        self.enable_audio_analysis = enable_audio_analysis
+        self.enable_semantic_scoring = enable_semantic_scoring and semantic_model is not None
+        self._heuristics = self._load_heuristics()
+        self._heuristic_weights = {
+            '_heuristic_advanced_separators': float(os.getenv('WEIGHT_SEPARATORS', 1.0)),
+            '_heuristic_multiple_dashes': float(os.getenv('WEIGHT_DASHES', 0.95)),
+            '_heuristic_featured_artists': float(os.getenv('WEIGHT_FEATURED', 0.90)),
+            '_heuristic_brackets': float(os.getenv('WEIGHT_BRACKETS', 0.85)),
+            '_heuristic_capitalization': float(os.getenv('WEIGHT_CAPITALIZATION', 0.80)),
+            '_heuristic_compact_title': float(os.getenv('WEIGHT_COMPACT', 0.75)),
+            '_heuristic_description': float(os.getenv('WEIGHT_DESCRIPTION', 0.90)),
+            '_heuristic_comma_swap': float(os.getenv('WEIGHT_COMMA_SWAP', 0.80)),
+            '_heuristic_cover_by': float(os.getenv('WEIGHT_COVER_BY', 0.85)),
+            '_heuristic_by_split': float(os.getenv('WEIGHT_BY_SPLIT', 0.80)),
+            '_heuristic_last_word_artist': float(os.getenv('WEIGHT_LAST_WORD', 0.75)),
+            '_heuristic_ascii_order': float(os.getenv('WEIGHT_ASCII_ORDER', 0.78)),
+            '_heuristic_swap_by_length': float(os.getenv('WEIGHT_SWAP_LENGTH', 0.82)),
+            '_heuristic_capital_split': float(os.getenv('WEIGHT_CAPITAL_SPLIT', 0.80)),
+            '_heuristic_ner_person': float(os.getenv('WEIGHT_NER_PERSON', 0.85)),
+            '_heuristic_parenthetical': float(os.getenv('WEIGHT_PARENTHETICAL', 0.88)),
+            '_heuristic_artist_list': float(os.getenv('WEIGHT_ARTIST_LIST', 0.88))
+        }
+        self._ffmpeg_available = self._check_ffmpeg()
+        self._ytdlp_available = self._check_ytdlp()
+        self._non_music_patterns = [
+            re.compile(r'\b(episodio|podcast|tutorial|how to|lesson|recopilación|top\s+\d+|interview|vlog)\b', re.I),
+            re.compile(r'\d{1,3}\s*[-–]\s*\D+', re.I),
+            re.compile(r'\b(?:full album|mix|cover\sversion)\b', re.I),
+            re.compile(r'\b(?:programa|special|edición)\b.*\d{4}', re.I)
+        ]
+
+    def _check_ffmpeg(self) -> bool:
+        """Checks if FFmpeg is installed."""
+        try:
+            subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+            return True
+        except (subprocess.SubprocessError, FileNotFoundError):
+            logger.warning("FFmpeg not installed or inaccessible")
+            return False
+
+    def _check_ytdlp(self) -> bool:
+        """Checks if yt-dlp is installed; attempts to install if missing."""
+        if shutil.which('yt-dlp'):
+            try:
+                subprocess.run(['yt-dlp', '--version'], capture_output=True, check=True)
+                return True
+            except (subprocess.SubprocessError, FileNotFoundError):
+                pass
+        logger.info("yt-dlp not found, attempting to install via pip...")
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"], check=False)
+            if shutil.which('yt-dlp'):
+                subprocess.run(['yt-dlp', '--version'], capture_output=True, check=True)
+                logger.info("yt-dlp installed successfully")
+                return True
+        except Exception as e:
+            logger.error(f"Failed to install yt-dlp: {str(e)}")
+        logger.warning("yt-dlp not installed or inaccessible")
+        return False
+
+    def extract(self, url: str) -> Dict[str, Any]:
+        """Extracts music metadata from a YouTube URL.
+
+        Args:
+            url (str): YouTube video URL.
+
+        Returns:
+            Dict[str, Any]: Dictionary with artist, title, confidence, method, and error.
+        """
+        import time
+        start_time = time.time()
+        if parse_requests_total:
+            parse_requests_total.inc()
+
+        try:
+            if not self._ytdlp_available:
+                logger.warning("yt-dlp unavailable, attempting oEmbed")
+            metadata = self._get_metadata(url)
+            if not metadata or 'title' not in metadata:
+                if parse_failed_total:
+                    parse_failed_total.inc()
+                return self._error_response("Failed to retrieve metadata", url)
+            title = self._enhance_title_processing(metadata.get('title', ''))
+            if len(title.strip()) < 6:
+                logger.warning(f"Title too short: {title}")
+                if parse_failed_total:
+                    parse_failed_total.inc()
+                return self._error_response("Title too short", url, confidence=0.1, method='too_short')
+            if self._is_non_music_content(title):
+                if parse_failed_total:
+                    parse_failed_total.inc()
+                return self._error_response("Non-music content detected", url, confidence=0.15)
+            result = self._process_data(title, metadata, url)
+            if parse_method_total:
+                parse_method_total.labels(result['method']).inc()
+            if parse_duration_hist:
+                parse_duration_hist.observe(time.time() - start_time)
+            return result
+        except Exception as e:
+            logger.error(f"Unexpected error: {str(e)}")
+            if parse_failed_total:
+                parse_failed_total.inc()
+            return self._error_response("Internal error", url)
+
+    def _enhance_title_processing(self, title: str) -> str:
+        """Cleans and normalizes the video title.
+
+        Args:
+            title (str): Raw video title.
+
+        Returns:
+            str: Cleaned title.
+        """
+        # Remove emojis and non-Latin script noise
+        title = re.sub(r'[^\x00-\x7F]+', ' ', title)
+        # Handle quoted titles (e.g., “Canción” de Artista)
+        quoted = re.findall(r'["“](.*?)["”]', title)
+        if quoted:
+            title = quoted[-1]
+        # Remove year prefixes
+        title = re.sub(r'^\d{4}\s*[-–]\s*', '', title)
+        # Remove noise words
+        noise_words = r'\b(?i)(official|video|lyrics|audio|cover|remix|edit|instrumental|karaoke|prod\.?|live|acoustic|version|original|hd|hq|vevo|channel)\b'
+        title = re.sub(noise_words, '', title)
+        # Remove brackets
+        title = re.sub(r'[\(\[\{].*?[\)\]\}]', '', title)
+        # Handle multiple pipes
+        if title.count('|') > 1:
+            title = title.split('|', 1)[1].strip()
+        # Clean extra spaces
+        title = re.sub(r'\s{2,}', ' ', title)
+        return title.strip()
+
+    def _is_non_music_content(self, title: str) -> bool:
+        """Checks if the title indicates non-music content."""
+        return any(pattern.search(title) for pattern in self._non_music_patterns)
+
+    def _load_heuristics(self) -> List[callable]:
+        """Loads heuristic methods for title parsing."""
+        heuristics = [
+            self._heuristic_advanced_separators,
+            self._heuristic_multiple_dashes,
+            self._heuristic_featured_artists,
+            self._heuristic_brackets,
+            self._heuristic_capitalization,
+            self._heuristic_compact_title,
+            self._heuristic_description,
+            self._heuristic_comma_swap,
+            self._heuristic_cover_by,
+            self._heuristic_by_split,
+            self._heuristic_last_word_artist,
+            self._heuristic_ascii_order,
+            self._heuristic_swap_by_length,
+            self._heuristic_capital_split,
+            self._heuristic_parenthetical,
+            self._heuristic_artist_list
+        ]
+        if nlp:
+            heuristics.append(self._heuristic_ner_person)
+        return heuristics
+
+    def _heuristic_advanced_separators(self, title: str) -> Tuple[Tuple[str, str], float]:
+        """Parses titles using common separators."""
+        separators = [
+            (' - ', 0.95), (' – ', 0.95), ('|', 0.85),
+            (' • ', 0.8), ('::', 0.75), ('//', 0.7)
+        ]
+        for sep, conf in separators:
+            if sep in title:
+                parts = title.split(sep, 1)
+                if self._valid_split(parts):
+                    return (parts[0].strip(), parts[1].strip()), conf
+        return ('', ''), 0.0
+
+    def _heuristic_multiple_dashes(self, title: str) -> Tuple[Tuple[str, str], float]:
+        """Parses titles with multiple dashes."""
+        if title.count('-') > 1 and not any(c.isdigit() for c in title.split('-')[0]):
+            parts = title.split('-', 1)
+            if self._valid_split(parts):
+                return (parts[0].strip(), parts[1].strip()), 0.92
+        return ('', ''), 0.0
+
+    def _heuristic_featured_artists(self, title: str) -> Tuple[Tuple[str, str], float]:
+        """Parses titles with featured artists."""
+        patterns = [
+            r"(.*?)\s[([]?(?:ft|feat|con|with|vs|prod\.?|remix)[)\]]?\s(.+?)[\]\)]",
+            r"^(.+?)\s(?:ft|feat|prod|vs)\.?\s(.+?)(?:\s[-\[]|$)"
+        ]
+        for pattern in patterns:
+            match = re.match(pattern, title, re.I)
+            if match:
+                artists = self._parse_featured_artists(match.group(1))
+                return (artists, match.group(2).strip()), 0.88
+        return ('', ''), 0.0
+
+    def _parse_featured_artists(self, artists: str) -> str:
+        """Cleans and formats featured artist names."""
+        split_chars = r'\s*(?:,|&|y|and)\s*|\s+'
+        unique_artists = []
+        for artist in re.split(split_chars, artists)[:3]:
+            if artist and artist not in unique_artists:
+                unique_artists.append(artist)
+        return ', '.join(unique_artists)
+
+    def _heuristic_brackets(self, title: str) -> Tuple[Tuple[str, str], float]:
+        """Parses titles with brackets."""
+        match = re.match(r'^(.*?)\s*[\(\[](.+?)[\)\]](.*)$', title)
+        if match:
+            before, inside, after = match.groups()
+            if self._valid_split([before, inside + after]):
+                return (before.strip(), (inside + after).strip()), 0.85
+        return ('', ''), 0.0
+
+    def _heuristic_capitalization(self, title: str) -> Tuple[Tuple[str, str], float]:
+        """Parses titles based on capitalization."""
+        match = re.match(r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+([A-Z][a-z]+.*)$', title)
+        if match and self._valid_split([match.group(1), match.group(2)]):
+            return (match.group(1), match.group(2)), 0.80
+        return ('', ''), 0.0
+
+    def _heuristic_compact_title(self, title: str) -> Tuple[Tuple[str, str], float]:
+        """Parses compact titles without clear separators."""
+        match = re.match(r'^([A-Z][a-z]+(?:[A-Z][a-z]+)+)([A-Z][a-z]+.*)$', title)
+        if match and self._valid_split([match.group(1), match.group(2)]):
+            return (match.group(1), match.group(2)), 0.75
+        match = re.match(r'^([A-Za-z]+(?:\s+[A-Za-z]+)*)\s+([A-Za-z]+.*)$', title)
+        if match and self._valid_split([match.group(1), match.group(2)]):
+            return (match.group(1), match.group(2)), 0.70
+        return ('', ''), 0.0
+
+    def _heuristic_description(self, title: str, metadata: Dict[str, Any] = None) -> Tuple[Tuple[str, str], float]:
+        """Parses video description for explicit metadata."""
+        description = metadata.get('description', '') if metadata else ''
+        artist_patterns = [
+            r'(?:Artist|Artista|Performed by|By):\s*([^\n]+)',
+            r'(?:Artista|By):\s*([^\n]+)'
+        ]
+        song_patterns = [
+            r'(?:Song|Canción|Título|Title):\s*([^\n]+)',
+            r'(?:Título|Song):\s*([^\n]+)'
+        ]
+        artist = None
+        song = None
+        for pattern in artist_patterns:
+            match = re.search(pattern, description, re.I)
+            if match:
+                artist = match.group(1).strip()
+                break
+        for pattern in song_patterns:
+            match = re.search(pattern, description, re.I)
+            if match:
+                song = match.group(1).strip()
+                break
+        if artist and song and self._valid_split([artist, song]):
+            return (artist, song), 0.95
+        return ('', ''), 0.0
+
+    def _heuristic_comma_swap(self, title: str) -> Tuple[Tuple[str, str], float]:
+        """Parses 'Title, Artist' format."""
+        parts = title.split(',', 1)
+        if len(parts) == 2 and self._valid_split([parts[1].strip(), parts[0].strip()]):
+            return (parts[1].strip(), parts[0].strip()), 0.80
+        return ('', ''), 0.0
+
+    def _heuristic_cover_by(self, title: str) -> Tuple[Tuple[str, str], float]:
+        """Parses 'Song Cover by Artist' format."""
+        if 'cover by' in title.lower():
+            idx = title.lower().index('cover by')
+            title_part = title[:idx].rstrip(" -:")
+            artist_part = title[idx + len('cover by'):].lstrip(" -:")
+            if self._valid_split([artist_part, title_part]):
+                return (artist_part.strip(), title_part.strip()), 0.85
+        return ('', ''), 0.0
+
+    def _heuristic_by_split(self, title: str) -> Tuple[Tuple[str, str], float]:
+        """Parses 'Song by Artist' format."""
+        if ' by ' in title.lower():
+            idx = title.lower().index(' by ')
+            title_part = title[:idx].rstrip(" -:")
+            artist_part = title[idx + len(' by '):].lstrip(" -:")
+            if self._valid_split([artist_part, title_part]):
+                return (artist_part.strip(), title_part.strip()), 0.80
+        return ('', ''), 0.0
+
+    def _heuristic_last_word_artist(self, title: str) -> Tuple[Tuple[str, str], float]:
+        """Parses 'Song Name Artist' format."""
+        words = title.split()
+        if len(words) > 4:
+            artist = words[-1]
+            song = ' '.join(words[:-1])
+            if self._valid_split([artist, song]):
+                return (artist.strip(), song.strip()), 0.75
+        return ('', ''), 0.0
+
+    def _heuristic_ascii_order(self, title: str) -> Tuple[Tuple[str, str], float]:
+        """Parses dash-separated titles, prioritizing ASCII-heavy part as artist."""
+        parts = title.split(' - ', 1)
+        if len(parts) == 2:
+            ascii0 = sum(ord(c) < 128 for c in parts[0])
+            ascii1 = sum(ord(c) < 128 for c in parts[1])
+            if self._valid_split(parts):
+                if ascii0 >= ascii1:
+                    return (parts[0].strip(), parts[1].strip()), 0.78
+                else:
+                    return (parts[1].strip(), parts[0].strip()), 0.78
+        return ('', ''), 0.0
+
+    def _heuristic_swap_by_length(self, title: str) -> Tuple[Tuple[str, str], float]:
+        """Swaps artist/title if the part before dash is longer."""
+        parts = title.split(' - ', 1)
+        if len(parts) == 2:
+            if len(parts[0]) < len(parts[1]):
+                return (parts[0].strip(), parts[1].strip()), 0.82
+            else:
+                return (parts[1].strip(), parts[0].strip()), 0.82
+        return ('', ''), 0.0
+
+    def _heuristic_capital_split(self, title: str) -> Tuple[Tuple[str, str], float]:
+        """Splits where a capitalized word follows lowercase, assuming title start."""
+        words = title.split()
+        idx = next((i for i, w in enumerate(words[1:], start=1) if len(w) > 1 and w[0].isupper() and w[1].islower()), None)
+        if idx:
+            artist = ' '.join(words[:idx])
+            song = ' '.join(words[idx:])
+            if self._valid_split([artist, song]):
+                return (artist.strip(), song.strip()), 0.80
+        return ('', ''), 0.0
+
+    def _heuristic_ner_person(self, title: str) -> Tuple[Tuple[str, str], float]:
+        """Uses spaCy NER to extract artist names."""
+        if not nlp:
+            return ('', ''), 0.0
+        try:
+            doc = nlp(title)
+            for ent in doc.ents:
+                if ent.label_ == 'PERSON':
+                    artist = ent.text.strip()
+                    song = title.replace(artist, '').strip()
+                    if self._valid_split([artist, song]):
+                        return (artist, song), 0.85
+        except Exception as e:
+            logger.error(f"NER parsing failed: {e}")
+        return ('', ''), 0.0
+
+    def _heuristic_parenthetical(self, title: str) -> Tuple[Tuple[str, str], float]:
+        """Parses 'Song (Artist)' format."""
+        match = re.match(r'^(.+?)\s*\(([^)]+)\)$', title)
+        if match and self._valid_split([match.group(2), match.group(1)]):
+            return (match.group(2).strip(), match.group(1).strip()), 0.88
+        return ('', ''), 0.0
+
+    def _heuristic_artist_list(self, title: str) -> Tuple[Tuple[str, str], float]:
+        """Parses 'Artist1, Artist2 & Artist3 - Song Title' format."""
+        if re.search(r', | & ', title):
+            parts = re.split(r' - | – ', title)
+            if len(parts) == 2 and len(parts[0].split(', ')) > 1:
+                if self._valid_split(parts):
+                    return (parts[0].strip(), parts[1].strip()), 0.88
+        return ('', ''), 0.0
+
+    def _valid_split(self, parts: List[str]) -> bool:
+        """Validates artist and title parts."""
+        return (len(parts) == 2 and
+                2 < len(parts[0]) < 50 and
+                not re.match(r'^\d+[\dkK]*$', parts[0]) and  # Filter numeric artists like "24k"
+                5 < len(parts[1]) < 150 and
+                not parts[1].startswith(('(', '[', 'www')) and
+                not any(word in parts[0].lower() for word in ['video', 'official', 'lyrics', 'feat', 'cover', 'remix']))
+
+    def _preprocess_semantic(self, text: str) -> str:
+        """Preprocesses text for semantic scoring."""
+        return re.sub(r'\b(?:official|video|lyrics|audio|cover|remix)\b', '', text, flags=re.I)
+
+    def _process_data(self, title: str, metadata: Dict[str, Any], url: str) -> Dict[str, Any]:
+        """Processes title and metadata to extract artist and title."""
+        if metadata.get('artist') and metadata.get('track'):
+            return {
+                'artist': metadata['artist'],
+                'title': metadata['track'],
+                'confidence': 0.98,
+                'method': 'metadata',
+                'error': None
+            }
+
+        candidates = []
+        with ThreadPoolExecutor(max_workers=len(self._heuristics)) as pool:
+            futures = []
+            for heuristic in self._heuristics:
+                args = (title, metadata) if heuristic.__name__ == '_heuristic_description' else (title,)
+                futures.append(pool.submit(heuristic, *args))
+            for future in as_completed(futures):
+                try:
+                    (artist, title_split), confidence = future.result()
+                    if artist and title_split:
+                        candidates.append(((artist, title_split), confidence, future._fn.__name__))
+                except Exception as e:
+                    logger.error(f"Heuristic {future._fn.__name__} failed: {e}")
+
+        valid = [c for c in candidates if self._valid_split(c[0])]
+        if not valid:
+            logger.warning("No valid candidates, defaulting to title as song")
+            if parse_failed_total:
+                parse_failed_total.inc()
+            return {
+                'artist': 'Unknown',
+                'title': title.strip() or 'Unknown',
+                'confidence': 0.1,
+                'method': 'fallback',
+                'error': None
+            }
+
+        best_candidate, method = self._select_best_candidate(valid, metadata)
+        confidence = self._calculate_confidence(valid, metadata, best_candidate)
+        if parse_heuristic_total:
+            parse_heuristic_total.labels(method).inc()
+        return {
+            'artist': best_candidate[0] or 'Unknown',
+            'title': best_candidate[1] or title,
+            'confidence': confidence,
+            'method': method,
+            'error': None
+        }
+
+    def _select_best_candidate(self, candidates: List, metadata: Dict[str, Any]) -> Tuple[Tuple[str, str], str]:
+        """Selects the best candidate using normalized weighted scoring."""
+        if not candidates:
+            return (('', ''), 'fallback')
+
+        pair_counts = Counter((c[0][0], c[0][1]) for c in candidates)
+        scores = []
+        uploader = metadata.get('uploader', '').lower()
+        tags = [t.lower() for t in metadata.get('tags', [])] if isinstance(metadata.get('tags'), list) else []
+        categories = metadata.get('categories', [])
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            dbpedia_futures = {pool.submit(self._validate_dbpedia, c[0][0], c[0][1]): c for c in candidates[:3]}
+
+            for (artist, title), count in pair_counts.items():
+                pair_candidates = [c for c in candidates if c[0] == (artist, title)]
+                heuristic_score = sum(
+                    c[1] * self._heuristic_weights.get(c[2], 0.5) * (1 + 0.1 * count)
+                    for c in pair_candidates
+                ) * 0.5  # 50% heuristic agreement
+
+                context_score = 0.0
+                if artist.lower() in uploader or uploader.startswith(artist.lower()) or uploader.endswith(artist.lower()):
+                    context_score += 0.3
+                if any(artist.lower() == tag or title.lower() == tag for tag in tags):
+                    context_score += 0.2
+                if 'Music' in categories:
+                    context_score += 0.1
+                context_score *= 0.25  # 25% context
+
+                semantic_score = 0.0
+                if self.enable_semantic_scoring and semantic_model:
+                    try:
+                        embeddings = semantic_model.encode([
+                            self._preprocess_semantic(f"Artist: {artist}"),
+                            self._preprocess_semantic(f"Title: {title}")
+                        ], convert_to_tensor=True)
+                        semantic_score = (float(util.cos_sim(embeddings[0], embeddings[1])) + 1) / 2 * 0.1  # 10% semantic
+                    except Exception as e:
+                        logger.warning(f"Semantic scoring failed: {e}")
+
+                dbpedia_score = 0.0
+                for future, cand in dbpedia_futures.items():
+                    if cand[0] == (artist, title):
+                        dbpedia_score = future.result() * 0.15  # 15% DBpedia
+                        break
+
+                final_score = heuristic_score + context_score + semantic_score + dbpedia_score
+                scores.append(((artist, title), final_score, pair_candidates[0][2]))
+
+        if scores:
+            best = max(scores, key=lambda x: x[1])
+            return best[0], best[2]
+        return (('', ''), 'fallback')
+
+    def _calculate_confidence(self, candidates: List, metadata: Dict, best_candidate: Tuple[str, str]) -> float:
+        """Calculates confidence score."""
+        base = min(len(candidates) * 0.25, 0.85)
+        duration = metadata.get('duration', 0)
+        tags = [t.lower() for t in metadata.get('tags', [])] if isinstance(metadata.get('tags'), list) else []
+        categories = metadata.get('categories', [])
+        modifiers = {
+            'duration': 0.15 if 30 < duration < 720 else -0.05,
+            'views': 0.05 if metadata.get('view_count', 0) > 1000 else 0,
+            'channel_verified': 0.1 if metadata.get('channel', {}).get('verified', False) else 0,
+            'quoted_title': 0.1 if '"' in metadata.get('title', '') else 0,
+            'music_category': 0.1 if 'Music' in categories else 0,
+            'tag_match': 0.05 if any(c[0][0].lower() in tags or c[0][1].lower() in tags for c in candidates) else 0
+        }
+        return round(min(base + sum(modifiers.values()), 0.99), 2)
+
+    @cached(dbpedia_cache)
+    def _validate_dbpedia(self, artist: str, title: str) -> float:
+        """Validates artist-title pair using DBpedia with partial matching."""
+        try:
+            query = (
+                "PREFIX dbo: <http://dbpedia.org/ontology/> "
+                "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> "
+                "ASK WHERE {{ ?song a dbo:Song; "
+                "dbo:artist [ rdfs:label ?artname ]; "
+                "rdfs:label ?title . "
+                "FILTER (CONTAINS(LCASE(?title), '{title_lower}') && "
+                "CONTAINS(LCASE(?artname), '{artist_lower}')) }}"
+            ).format(title_lower=title.lower(), artist_lower=artist.lower())
+            resp = session.get('https://dbpedia.org/sparql', params={'query': query, 'format': 'json'}, timeout=3)
+            if resp.status_code == 200 and resp.json().get('boolean'):
+                return 0.90
+        except Exception as e:
+            logger.warning(f"DBpedia validation failed: {str(e)}")
+        return 0.0
+
+    def _validate_musicbrainz(self, artist: str, title: str) -> float:
+        """Placeholder for MusicBrainz validation (requires API key)."""
+        # TODO: Implement MusicBrainz API call
+        return 0.0
+
+    @cached(metadata_cache)
+    def _get_metadata(self, url: str) -> Dict[str, Any]:
+        """Fetches video metadata using yt-dlp and oEmbed."""
+        def fetch_ytdlp():
+            try:
+                cmd = ['yt-dlp', '--dump-json', '--no-playlist', '--socket-timeout', '10', url]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+                if result.returncode != 0:
+                    logger.error(f"yt-dlp error (code {result.returncode}): {result.stderr}")
+                    return {}
+                metadata = json.loads(result.stdout)
+                if 'title' not in metadata:
+                    logger.warning("yt-dlp metadata lacks title")
+                    return {}
+                return metadata
+            except Exception as e:
+                logger.error(f"yt-dlp error: {str(e)}")
+                return {}
+
+        def fetch_oembed():
+            try:
+                resp = session.get(
+                    'https://www.youtube.com/oembed',
+                    params={'url': url, 'format': 'json'},
+                    timeout=10
+                )
+                resp.raise_for_status()
+                metadata = resp.json()
+                if 'title' not in metadata:
+                    logger.warning("oEmbed metadata lacks title")
+                    return {}
+                return metadata
+            except Exception as e:
+                logger.error(f"oEmbed error: {str(e)}")
+                return {}
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            yt_future = pool.submit(fetch_ytdlp)
+            oe_future = pool.submit(fetch_oembed)
+            yt_result = yt_future.result()
+            oe_result = oe_future.result()
+
+        return yt_result if 'title' in yt_result else oe_result
+
+    def _error_response(self, message: str, url: str, confidence: float = 0.0, method: str = 'error') -> Dict[str, Any]:
+        """Creates an error response."""
+        return {
+            'artist': 'Error',
+            'title': urlparse(url).path.split('/')[-1][:50],
+            'confidence': confidence,
+            'method': method,
+            'error': message
+        }
+
+@dataclass
+class Result:
+    """Dataclass for extraction results."""
+    artist: str
+    title: str
+    confidence: float
+    method: str
+    error: str = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {k: v for k, v in vars(self).items() if v is not None}
+
+def main():
+    """CLI interface for YouTubeMusicExtractor."""
+    parser = argparse.ArgumentParser(description="Extract music metadata from YouTube URLs.")
+    parser.add_argument('-u', '--url', help="Single YouTube URL")
+    parser.add_argument('-f', '--file', help="File with YouTube URLs (one per line)")
+    parser.add_argument('-o', '--output', help="Output JSON file (optional)")
+    parser.add_argument('--semantic', action='store_true', help="Enable semantic scoring")
+    args = parser.parse_args()
+
+    if not (args.url or args.file):
+        parser.error("Either --url or --file must be provided")
+
+    extractor = YouTubeMusicExtractor(enable_semantic_scoring=args.semantic)
+    results = []
+
+    if args.url:
+        result = extractor.extract(args.url)
+        results.append(Result(**result).to_dict())
+    elif args.file:
+        try:
+            with open(args.file, 'r') as f:
+                urls = [line.strip() for line in f if line.strip()]
+            for url in urls:
+                result = extractor.extract(url)
+                results.append(Result(**result).to_dict())
+        except Exception as e:
+            logger.error(f"Failed to read file {args.file}: {str(e)}")
+            sys.exit(1)
+
+    output = json.dumps(results, indent=2, ensure_ascii=False)
+    if args.output:
+        try:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(output)
+            print(f"Results saved to {args.output}")
+        except Exception as e:
+            logger.error(f"Failed to write output file {args.output}: {str(e)}")
+            sys.exit(1)
+    else:
+        print(output)
+
+if __name__ == '__main__':
+    main()

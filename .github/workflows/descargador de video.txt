@@ -1,92 +1,378 @@
-# requirements: yt-dlp>=2024.4.0
-# api_keys:
+# requirements: yt-dlp>=2024.4.0, tenacity>=8.0.0, ffmpeg>=4.4.0, librosa>=0.8.1
 
+# api\_keys: None
+
+```python
 import os
+import sys
 import re
 import shutil
 import subprocess
 import time
+import threading
 import argparse
-from urllib.request import urlopen
-from typing import Optional, Tuple
-from yt_dlp import YoutubeDL, DownloadError
+import logging
+import signal
+from typing import Tuple, List
+from urllib.request import Request, urlopen
+import psutil
+import tempfile
+import librosa
+from yt_dlp import YoutubeDL
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tqdm import tqdm
+import argcomplete
 
+# Logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(name)s:%(lineno)d - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Exceptions\class VideoValidationError(Exception):
+    """Raised when video/audio validation fails."""
+    pass
+
+class DownloadErrorExternal(Exception):
+    """Raised on external download failures (network, thumbnails)."""
+    pass
+
+class CalibrationError(Exception):
+    """Raised when network calibration cannot determine chunk size/concurrency."""
+    pass
+
+# Global configuration
 class Config:
-    FORMATO_OBJETIVO = "bv*[height<=720][fps<=30][ext=mp4]+ba[ext=m4a]/best[height<=720][fps<=30]"
-    EXTENSION_SALIDA = "mp4"
-    CHUNK_SIZE = "2M"
-    CONCURRENT_FRAGMENTS = 5
-    HTTP2 = True
-    RETRIES = 3
-    OVERWRITE = False
+    """Global constants for UltraMakerCore operations."""
+    FORMAT_TARGET    = "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]"
+    MERGE_FORMAT     = "mp4"
+    MP3_BITRATE      = "192k"
+    TIMEOUT_FFPROBE  = 10
+    TEST_BYTES       = 256 * 1024
+    SOCKET_TIMEOUT   = 15
+    MAX_CONCURRENT   = min(6, psutil.cpu_count(logical=False) or 6)
+    FFMPEG_THREADS   = 6
+    HWACCEL          = "auto"
+    VIDEO_CODEC      = "h264_amf"
+    COVER_SIZE       = "512:512"
+    TIMEOUT_WATCHDOG = 300  # seconds
 
-class UltraMakerDownloader:
-    def __init__(self, carpeta_destino: str = "CANCIONES", formato: str = Config.FORMATO_OBJETIVO):
-        self.carpeta_destino = carpeta_destino
-        self.formato = formato
+# Utilities
+class Utils:
+    """Helper functions for temp cleanup and folder creation."""
+    @staticmethod
+    def cleanup_temp_files(dest: str):
+        """Remove intermediate .part/.tmp files in the target directory."""
+        for fname in os.listdir(dest):
+            if fname.endswith(('.part', '.tmp')):
+                try:
+                    os.remove(os.path.join(dest, fname))
+                except:
+                    logger.warning(f"Could not remove temp file {fname}")
 
-    def slugify(self, text: str) -> str:
-        text = re.sub(r"\s+", "_", text)
-        text = re.sub(r'[\\/*?:"<>|]', "", text)
-        return text[:100]
+    @staticmethod
+    def create_artist_folder(dest: str, artist: str, title: str) -> str:
+        """Construct and create a sanitized 'artist-title' folder under dest."""
+        safe_artist = SlugGenerator.slugify_pure(artist) if artist else ''
+        safe_title  = SlugGenerator.slugify_pure(title)
+        name        = f"{safe_artist}-{safe_title}" if safe_artist else safe_title
+        path        = os.path.normpath(os.path.join(dest, name))
+        os.makedirs(path, exist_ok=True)
+        return path
 
-    def _validar_video(self, ruta: str) -> bool:
-        if not os.path.isfile(ruta) or os.path.getsize(ruta) < 10 * 1024:
-            return False
-        try:
-            out = subprocess.check_output([
-                "ffprobe", "-v", "error", "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1", ruta
-            ], stderr=subprocess.DEVNULL, text=True)
-            return float(out.strip()) > 0.0
-        except Exception:
-            return False
+# SIGINT handler
+def handle_sigint(signum, frame):
+    """Cleanly terminate child processes and remove temp files on CTRL+C."""
+    logger.warning("SIGINT received, terminating children and cleaning up...")
+    proc = psutil.Process(os.getpid())
+    for child in proc.children(recursive=True):
+        try: child.terminate()
+        except: pass
+    Utils.cleanup_temp_files(os.getcwd())
+    sys.exit(1)
+signal.signal(signal.SIGINT, handle_sigint)
 
-    def _generar_ruta_final(self, info: dict) -> str:
-        titulo = self.slugify(info.get("title", "video"))
-        extension = info.get("ext", Config.EXTENSION_SALIDA)
-        return os.path.join(self.carpeta_destino, f"{titulo}.{extension}")
+# Progress bar hook
+class ProgressBar:
+    """Integrate yt-dlp progress with a single tqdm bar."""
+    def __init__(self):
+        self.bar = None
+    def __call__(self, d):
+        if d['status'] == 'downloading':
+            total = d.get('total_bytes') or d.get('total_bytes_estimate')
+            if total and self.bar is None:
+                self.bar = tqdm(total=total, unit='B', unit_scale=True)
+            if self.bar:
+                downloaded = d.get('downloaded_bytes', 0)
+                self.bar.update(downloaded - self.bar.n)
+        elif d['status'] == 'finished' and self.bar:
+            self.bar.close()
+progress_hook = ProgressBar()
 
-    def _construir_opciones(self, plantilla_salida: str, verbose: bool, usar_aria2c: bool, sobrescribir: bool) -> dict:
-        opciones = {
-            "format": self.formato,
-            "outtmpl": plantilla_salida,
-            "merge_output_format": Config.EXTENSION_SALIDA,
-            "noplaylist": True,
-            "quiet": not verbose,
-            "nooverwrites": not sobrescribir,
-            "http_chunk_size": Config.CHUNK_SIZE,
-            "retries": Config.RETRIES,
-            "concurrent_fragment_downloads": Config.CONCURRENT_FRAGMENTS,
-            "http2": Config.HTTP2
-        }
-        if usar_aria2c:
-            opciones.update({
-                "external_downloader": "aria2c",
-                "external_downloader_args": ["--summary-interval=0", "-x", "16", "-k", Config.CHUNK_SIZE, "--file-allocation=none"]
-            })
-        return opciones
+# Slug generator
+class SlugGenerator:
+    """Create filesystem-safe unique slugs for filenames."""
+    def __init__(self, dest: str):
+        self.dest = dest
+    @staticmethod
+    def slugify_pure(text: str) -> str:
+        """Sanitize text to [a-z0-9_] and truncate; remove dots."""
+        base = re.sub(r"[^\w\- ]", "", text).strip()
+        base = re.sub(r"[\s\-]+", "_", base).lower()
+        base = base.replace('.', '')
+        return base[:100] or "media"
+    def make_slug(self, text: str, ext: str) -> str:
+        """Ensure slug.ext is unique in dest by appending suffix if needed."""
+        base = self.slugify_pure(text)
+        slug = base; i = 1
+        path = os.path.join(self.dest, f"{slug}.{ext}")
+        while os.path.exists(path):
+            slug = f"{base}_{i}"; i += 1
+            path = os.path.join(self.dest, f"{slug}.{ext}")
+        return slug
 
-    def descargar_video(self, url: str, verbose: bool = False, sobrescribir: bool = False) -> Optional[Tuple[str, float]]:
-        plantilla_salida = os.path.join(self.carpeta_destino, "%(title).100s.%(ext)s")
-        usar_aria2c = shutil.which("aria2c") is not None
-        opciones = self._construir_opciones(plantilla_salida, verbose, usar_aria2c, sobrescribir)
-
-        for intento in range(1, Config.RETRIES + 1):
+# Network calibration
+class NetworkCalibrator:
+    """Compute download chunk size and concurrency based on bandwidth."""
+    @staticmethod
+    def calibrate(urls: List[str]) -> Tuple[str, int]:
+        """Measure first N URLs, discard failures, derive chunk/frags."""
+        speeds = []
+        for u in urls[:5]:  # sample up to 5 URLs
             try:
-                with YoutubeDL(opciones) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    ruta_final = self._generar_ruta_final(info)
-                    duracion = info.get("duration", 0.0)
-                    if self._validar_video(ruta_final):
-                        return ruta_final, duracion
-                    raise Exception("Archivo descargado inválido")
-            except DownloadError:
-                if intento == Config.RETRIES:
-                    return None
-                time.sleep(2 ** intento)
+                req = Request(u); req.add_header('Range', f"bytes=0-{Config.TEST_BYTES-1}")
+                t0 = time.time()
+                urlopen(req, timeout=Config.SOCKET_TIMEOUT).read()
+                dt = max(time.time() - t0, 1e-6)
+                speeds.append(Config.TEST_BYTES / dt)
             except Exception:
-                if intento == Config.RETRIES:
-                    return None
-                time.sleep(2 ** intento)
-        return None
+                continue
+        if not speeds:
+            logger.error("Calibration failed: no speed samples.")
+            raise CalibrationError
+        avg = sum(speeds) / len(speeds)
+        chunk = '4M' if avg > 5e6 else '1M'
+        frags = min(Config.MAX_CONCURRENT, max(1, int(avg/1e6)))
+        return chunk, frags
+
+# Thumbnail downloader
+class ThumbnailDownloader:
+    """Fetch and validate JPEG thumbnails with retries."""
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2))
+    def download(self, url: str) -> bytes:
+        r = urlopen(Request(url), timeout=Config.SOCKET_TIMEOUT)
+        data = r.read()
+        if data[:3] != b'\xFF\xD8\xFF':
+            logger.error("Invalid thumbnail header.")
+            raise DownloadErrorExternal
+        return data
+
+# Media processing
+class MediaProcessor:
+    """Convert video to MP3 and scale covers via ffmpeg."""
+    @staticmethod
+    def check_hw_codec():
+        try:
+            codecs = subprocess.check_output(['ffmpeg','-codecs'], text=True)
+            if Config.VIDEO_CODEC not in codecs:
+                Config.VIDEO_CODEC = 'libx264'
+        except Exception:
+            Config.VIDEO_CODEC = 'libx264'
+
+    @staticmethod
+    def convert_to_mp3(input_path: str, output_path: str):
+        """Extract audio to MP3 using libmp3lame and hardware accel (timeout enforced)."""
+        timeout = max(30, librosa.get_duration(filename=input_path) * 1.5)
+        subprocess.run([
+            'ffmpeg', '-hwaccel', Config.HWACCEL, '-y', '-i', input_path,
+            '-vn', '-acodec', 'libmp3lame', '-b:a', Config.MP3_BITRATE,
+            '-threads', str(Config.FFMPEG_THREADS), output_path
+        ], check=True, timeout=timeout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    @staticmethod
+    def process_cover(data: bytes, output_path: str):
+        """Scale and write JPEG cover to disk."""
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
+        tmp.write(data); tmp.close()
+        subprocess.run([
+            'ffmpeg', '-y', '-i', tmp.name,
+            '-vf', f'scale={Config.COVER_SIZE}', '-frames:v', '1',
+            '-c:v', Config.VIDEO_CODEC, output_path
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        os.remove(tmp.name)
+
+# UltraStar metadata
+class UltraStarMetadata:
+    """Write metadata.txt file for UltraStar karaoke."""
+    @staticmethod
+    def generate_txt(folder: str, title: str, artist: str, language: str, bpm: int):
+        path = os.path.join(folder, 'metadata.txt')
+        lang = language or ('English' if re.search(r'[A-Za-z]', title) else 'Spanish')
+        with open(path, 'w', encoding='utf-8-sig') as f:
+            f.write(
+                f"#TITLE:{title}\n"
+                f"#ARTIST:{artist}\n"
+                f"#LANGUAGE:{lang}\n"
+                f"#BPM:{bpm}\n"
+                f"#COVER:cover.jpg\n"
+            )
+
+# Core downloader
+class UltraMakerCore:
+    """Main orchestrator: calibrate, download, post-process media."""
+    def __init__(
+        self, dest: str, quiet: bool, overwrite: bool,
+        bitrate: str, bpm: int, language: str,
+        fmt: str, quality: str, bpm_est: bool
+    ):
+        # prerequisites
+        if not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
+            logger.error('Install ffmpeg and ffprobe in PATH')
+            sys.exit(1)
+        MediaProcessor.check_hw_codec()
+
+        # instance vars
+        self.dest = dest; self.quiet = quiet; self.overwrite = overwrite
+        Config.MP3_BITRATE = bitrate
+        cur_fmt = fmt or Config.FORMAT_TARGET
+        if quality != 'best': cur_fmt = f"bestvideo[height<={quality}]+bestaudio"
+        Config.FORMAT_TARGET = cur_fmt
+        self.initial_bpm   = bpm
+        self.bpm_estimate  = bpm_est
+        self.language      = language
+        self.slug_gen      = SlugGenerator(dest)
+        self.thumb_dl      = ThumbnailDownloader()
+        self.aria2c        = bool(shutil.which('aria2c'))
+        os.makedirs(dest, exist_ok=True)
+
+    def _start_watchdog(self, pid: int):
+        """Kill the process if it hangs beyond timeout."""
+        def watch():
+            time.sleep(Config.TIMEOUT_WATCHDOG)
+            try:
+                if psutil.pid_exists(pid):
+                    psutil.Process(pid).kill()
+                    logger.error(f"Watchdog: PID {pid} killed.")
+            except:
+                logger.warning("Watchdog encountered error.")
+        threading.Thread(target=watch, daemon=True).start()
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(),
+        retry=retry_if_exception_type((DownloadErrorExternal, CalibrationError))
+    )
+    def execute_download(self, url: str) -> Tuple[str, float]:
+        """Run full pipeline: calibrate, download, convert, cover, metadata."""
+        # Phase 1: calibration
+        try:
+            probe = YoutubeDL({'format': Config.FORMAT_TARGET, 'noplaylist': True, 'quiet': True})
+            info0 = probe.extract_info(url, download=False)
+            urls = [f['url'] for f in info0.get('formats', [])]
+            chunk, frags = NetworkCalibrator.calibrate(urls)
+        except CalibrationError as e:
+            logger.error(f"Calibration step failed: {e}")
+            raise
+
+        # Phase 2: download
+        outtmpl = os.path.join(self.dest, '%(id)s.%(ext)s')
+        opts = {
+            'format': Config.FORMAT_TARGET,
+            'merge_output_format': Config.MERGE_FORMAT,
+            'outtmpl': outtmpl,
+            'http_chunk_size': chunk,
+            'concurrent_fragment_downloads': frags,
+            'socket_timeout': Config.SOCKET_TIMEOUT,
+            'quiet': self.quiet,
+            'nooverwrites': not self.overwrite,
+            'progress_hooks': [] if self.quiet else [progress_hook]
+        }
+        if self.aria2c:
+            opts.update({ 'external_downloader': 'aria2c', 'external_downloader_args': ['-x', str(frags), chunk] })
+        try:
+            with YoutubeDL(opts) as ydl:
+                self._start_watchdog(os.getpid())
+                info = ydl.extract_info(url, download=True)
+        except Exception as e:
+            logger.error(f"Download failed: {e}")
+            raise DownloadErrorExternal(e)
+
+        # Phase 3: postprocessing
+        try:
+            raw      = info.get('title', 'media')
+            duration = info.get('duration', 0.0)
+            ext      = info.get('ext', Config.MERGE_FORMAT)
+            slug     = self.slug_gen.make_slug(raw, ext)
+            initial  = os.path.join(self.dest, f"{info.get('id')}.{ext}")
+            artist, title = raw.split(' - ',1) if ' - ' in raw else ('', raw)
+            folder   = Utils.create_artist_folder(self.dest, artist, title)
+
+            # move and convert
+            final_media = os.path.join(folder, f"{slug}.{ext}")
+            shutil.move(initial, final_media)
+            mp3 = os.path.join(folder, f"{slug}.mp3")
+            MediaProcessor.convert_to_mp3(final_media, mp3)
+
+            # BPM estimation
+            bpm_val = self.initial_bpm
+            if self.bpm_estimate:
+                try:
+                    y, sr = librosa.load(mp3, sr=None)
+                    bpm_val = int(librosa.beat.beat_track(y=y, sr=sr)[0])
+                except Exception as e:
+                    logger.warning(f"BPM estimate failed: {e}")
+
+            # cover processing
+            thumb = info.get('thumbnail')
+            if thumb:
+                data = self.thumb_dl.download(thumb)
+                MediaProcessor.process_cover(data, os.path.join(folder, 'cover.jpg'))
+
+            # metadata
+            UltraStarMetadata.generate_txt(folder, title, artist, self.language, bpm_val)
+
+            Utils.cleanup_temp_files(self.dest)
+            return mp3, duration
+        except Exception as e:
+            logger.error(f"Postprocessing failed: {e}")
+            raise
+
+# CLI entrypoint
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='UltraMaker CLI')
+    parser.add_argument('url')
+    parser.add_argument('-d','--dest',        default='CANCIONES')
+    parser.add_argument('-q','--quiet',       action='store_true')
+    parser.add_argument('-o','--overwrite',   action='store_true')
+    parser.add_argument('--bitrate',          default='192k')
+    parser.add_argument('--bpm', type=int,    default=0)
+    parser.add_argument('--language',          choices=['en','es'], default='en')
+    parser.add_argument('--format',   dest='fmt',    choices=['mp4','mp3','mkv'], default=None)
+    parser.add_argument('--quality',          choices=['best','720','480'], default='best')
+    parser.add_argument('--bpm-estimate',     action='store_true')
+    parser.add_argument('--batch-file',       help='File with list of URLs for batch processing')
+    argcomplete.autocomplete(parser)
+    args = parser.parse_args()
+
+    # adjust thread count
+    Config.FFMPEG_THREADS = psutil.cpu_count(logical=False) or 6
+
+    core = UltraMakerCore(
+        args.dest, args.quiet, args.overwrite,
+        args.bitrate, args.bpm, args.language,
+        args.fmt, args.quality, args.bpm_estimate
+    )
+    try:
+        if args.batch_file:
+            with open(args.batch_file) as f:
+                for line in f:
+                    out, dur = core.execute_download(line.strip())
+                    logger.info(f"✅ {out} ({dur:.2f}s)")
+        else:
+            out, dur = core.execute_download(args.url)
+            logger.info(f"✅ {out} ({dur:.2f}s)")
+    except Exception:
+        logger.error("❌ Processing failed, see errors above.")
+        sys.exit(1)
+```
