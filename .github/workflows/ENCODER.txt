@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+# requirements: python>=3.8, ffmpeg>=4.4.0, tqdm (opcional), psutil (opcional)
+
+import os
+import sys
+import signal
+import subprocess
+import tempfile
+import time
+import json
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache, wraps
+
+# --- Señal de salida limpia ---
+def analizar_cleanup():
+    pass  # Añadir limpieza de temporales si aplica
+
+def _handle_sigint(signum, frame):
+    analizar_cleanup()
+    print("\nCancelado por el usuario (SIGINT).")
+    sys.exit(0)
+signal.signal(signal.SIGINT, _handle_sigint)
+
+# --- Reintentos universales ---
+def try_wrapper(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        max_retries = kwargs.pop('max_retries', 2)
+        for attempt in range(max_retries + 1):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:
+                if attempt == max_retries:
+                    print(f"[ERROR] {fn.__name__}: {e}")
+                    if kwargs.get('raise_error'):
+                        raise
+                    return None
+                time.sleep(2)
+    return wrapper
+
+@try_wrapper
+def fetch_check_dependencies():
+    for tool in ('ffmpeg', 'ffprobe'):
+        subprocess.run([tool, '-version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+# --- Prefijos y utilidades ---
+def parse_framerate(fr: str):
+    try:
+        if '/' in fr:
+            num, den = map(float, fr.split('/'))
+            return num / den if den else 0.0
+        return float(fr)
+    except:
+        return 0.0
+
+def analizar_adjust_concurrency():
+    try:
+        import psutil
+        load = os.getloadavg()[0]
+        mem_avail = psutil.virtual_memory().available / (1024**3)
+        cpu_count = psutil.cpu_count(logical=False) or 2
+        return max(1, min(cpu_count, int(cpu_count * (0.8/(load+0.2))), int(mem_avail // 1.5)))
+    except:
+        return 2
+
+def parse_slugify(p: Path):
+    name = p.stem
+    return ''.join(c for c in name if c.isalnum() or c in ' -_')[:100] or 'video'
+
+@try_wrapper
+def analizar_medida_disk_throughput():
+    sample_mb = int(os.getenv('ENCODER_THROUGHPUT_SAMPLE_MB', '5'))
+    chunk_size = 32 * 1024 * 1024
+    total_bytes = sample_mb*1024*1024
+    tmp = tempfile.NamedTemporaryFile(delete=False)
+    try:
+        start = time.monotonic()
+        tmp.write(os.urandom(min(chunk_size, total_bytes)))
+        tmp.flush(); os.fsync(tmp.fileno())
+        wtime = time.monotonic() - start
+        tmp.close()
+        with open(tmp.name, 'rb') as f:
+            start = time.monotonic()
+            while f.read(chunk_size):
+                pass
+            rtime = time.monotonic() - start
+        return (sample_mb * 2) / (wtime + rtime) if (wtime + rtime)>0 else sample_mb
+    finally:
+        try:
+            if tmp and not tmp.closed:
+                tmp.close()
+            os.remove(tmp.name)
+        except:
+            pass
+
+@try_wrapper
+def analizar_detect_hardware_accel():
+    for (hw, params) in [
+        ('nvenc', ['-hwaccel', 'cuda', '-c:v', 'h264_nvenc']),
+        ('vaapi', ['-hwaccel', 'vaapi', '-c:v', 'h264_vaapi']),
+        ('cpu',   ['-c:v', 'libx264'])
+    ]:
+        try:
+            subprocess.run(['ffmpeg', '-y'] + params +
+                ['-f', 'lavfi', '-i', 'testsrc=duration=1:size=1280x720:rate=30', '-f', 'null', '-'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=10, check=True
+            )
+            return hw, params
+        except Exception:
+            continue
+    return 'cpu', ['-c:v', 'libx264']
+
+def analizar_calculate_timeout(file_size, throughput, height):
+    base = file_size / (throughput * 1024 ** 2)
+    complexity = 1 + (height / 1080) * 0.5
+    try:
+        import psutil
+        cpu_load = psutil.cpu_percent(interval=1) / 100
+    except ImportError:
+        cpu_load = 0.3
+    MIN_TIMEOUT = float(os.getenv('ENCODER_MIN_TIMEOUT_SEC', 60))
+    TIMEOUT_FACTOR = float(os.getenv('ENCODER_TIMEOUT_FACTOR', 1.2))
+    return max(MIN_TIMEOUT, base * complexity * (1 + cpu_load * 2) * TIMEOUT_FACTOR)
+
+@try_wrapper
+def analizar_validate_output(path: Path):
+    try:
+        meta = subprocess.check_output([
+            'ffprobe','-v','quiet','-print_format','json',
+            '-show_streams','-show_format',str(path)
+        ], text=True)
+        data = json.loads(meta)
+        stream = next((s for s in data["streams"] if s.get("codec_type")=="video"), None)
+        if not stream or 'h264' not in str(stream.get('codec_name','')):
+            raise RuntimeError("Codec inválido")
+        if int(stream['width']) < 640:
+            raise RuntimeError("Ancho insuficiente")
+        rate = parse_framerate(str(stream.get('avg_frame_rate',0)))
+        if rate < 24:
+            raise RuntimeError("Framerate insuficiente")
+        fdata = data.get('format',{})
+        if float(fdata.get('bit_rate',0))<100_000 or float(fdata.get('duration',0))<1:
+            raise RuntimeError("Bitrate/duración inválido")
+        return True
+    except Exception as e:
+        print(f"[ERROR] validar salida: {e}")
+        return False
+
+@try_wrapper
+def analizar_preserve_metadata(src: Path, dst: Path):
+    tmp = dst.with_suffix('.meta.mkv')
+    try:
+        subprocess.run([
+            'ffmpeg', '-y','-i',str(dst),'-i',str(src),
+            '-map', '0', '-map_metadata', '1', '-map_chapters', '1',
+            '-c', 'copy', '-metadata:s:v:0', 'encoder=UltraStar Encoder', str(tmp)
+            ], check=True, timeout=240)
+        if not tmp.exists():
+            raise RuntimeError("Meta no generada")
+        tmp.replace(dst)
+    except Exception as e:
+        print(f"[ERROR] metadatos: {e}")
+        try: tmp.unlink(missing_ok=True)
+        except: pass
+
+def analizar_encode_video(src: Path, dst: Path, opts: dict):
+    hw_type, hw_params = analizar_detect_hardware_accel()
+    threads = opts.get('threads', analizar_adjust_concurrency())
+    height  = opts.get('height', 720)
+    bitrate = opts.get('bitrate')
+    crf     = opts.get('crf')
+    movflags= opts.get('movflags')
+    cmd = ['ffmpeg','-y','-i',str(src)] + hw_params + ['-threads', str(threads)]
+    if height: cmd += ['-vf', f"scale=-2:{height}"]
+    if crf:
+        cmd += ['-crf', str(crf)]
+    elif bitrate:
+        cmd += ['-b:v', str(bitrate)]
+    cmd += ['-c:a','aac']
+    if movflags:
+        cmd += ['-movflags', str(movflags)]
+    cmd += [str(dst)]
+    timeout = analizar_calculate_timeout(src.stat().st_size, analizar_medida_disk_throughput(), height)
+    tmpdst = dst.with_suffix('.partial'+dst.suffix)
+    proc = subprocess.Popen(cmd[:-1]+[str(tmpdst)], stderr=subprocess.PIPE, text=True)
+    try:
+        proc.communicate(timeout=timeout)
+        if proc.returncode != 0:
+            raise RuntimeError(f"FFmpeg exited {proc.returncode}")
+        analizar_preserve_metadata(src, tmpdst)
+        tmpdst.replace(dst)
+        return True
+    except Exception as e:
+        proc.terminate()
+        try: tmpdst.unlink()
+        except: pass
+        print(f"[ERROR] codificando {src.name}: {e}")
+        return False
+
+def analizar_generate_ultrastar_txt(video_path: Path, output_dir: Path):
+    # Genera un .txt básico "compatible" UltraStar (placeholder)
+    txt_path = output_dir / (video_path.stem + '.txt')
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        f.write
